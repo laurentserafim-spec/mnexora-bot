@@ -1,1277 +1,831 @@
-# main.py
-# Nexora AI Discord bot (Public AI + Admin AI Planner/Executor)
-# Upgrades:
-# - Admin can issue commands in #ai-admin via @mention (no / needed)
-# - Added admin actions: send_message (optionally pin), pin_last_bot_message
-# - Keeps safety guardrails + audit log + modes (preview/confirm/execute/lock)
-
 import os
 import re
 import json
-import uuid
-import sqlite3
-import datetime
+import asyncio
+import datetime as dt
 from typing import Optional, Dict, Any, List, Tuple
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
+import aiosqlite
+from dotenv import load_dotenv
+
 from openai import OpenAI
 
+# =========================
+# Config
+# =========================
+load_dotenv()
 
-# =========================
-# ENV
-# =========================
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-DB_PATH = os.getenv("NEXORA_DB_PATH", "nexora.db")
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+
+AI_ADMIN_ALLOWLIST = set()
+_allow = os.getenv("AI_ADMIN_ALLOWLIST", "").strip()
+if _allow:
+    for x in _allow.split(","):
+        x = x.strip()
+        if x.isdigit():
+            AI_ADMIN_ALLOWLIST.add(int(x))
+
+AI_ADMIN_CHANNEL_NAME = os.getenv("AI_ADMIN_CHANNEL", "ai-admin").strip()
+AI_AUDIT_CHANNEL_NAME = os.getenv("AI_AUDIT_CHANNEL", "ai-audit-log").strip()
+AI_FREE_CHAT_CHANNELS = [x.strip() for x in os.getenv("AI_FREE_CHAT_CHANNELS", "ai-support,ai-guide").split(",") if x.strip()]
+
+FREE_DAILY_LIMIT = int(os.getenv("FREE_DAILY_LIMIT", "10"))
+SHOW_REMAINING = os.getenv("SHOW_REMAINING", "1").strip() == "1"
+REQUIRE_MENTION_OUTSIDE_FREE = os.getenv("REQUIRE_MENTION_OUTSIDE_FREE", "1").strip() == "1"
+
+# confirm | preview | lock
+ADMIN_MODE = os.getenv("ADMIN_MODE", "confirm").strip().lower()
+
+DB_PATH = "nexora.sqlite"
 
 if not DISCORD_TOKEN:
-    raise RuntimeError("Missing DISCORD_TOKEN")
+    raise RuntimeError("DISCORD_TOKEN is missing")
 if not OPENAI_API_KEY:
-    raise RuntimeError("Missing OPENAI_API_KEY")
+    raise RuntimeError("OPENAI_API_KEY is missing")
 
-ai = OpenAI(api_key=OPENAI_API_KEY)
-
-
-# =========================
-# DEFAULT SETTINGS
-# =========================
-DEFAULTS = {
-    "ai_help_channel": "ai-help",
-    "ai_admin_channel": "ai-admin",
-    "ai_audit_channel": "ai-audit-log",
-
-    "free_daily_limit": "10",
-    "show_remaining": "1",
-    "require_mention_outside_help": "1",
-
-    # admin execution modes:
-    # preview = plan only
-    # confirm = plan + buttons (recommended)
-    # execute = execute immediately (dangerous)
-    # lock = no execution at all
-    "admin_mode": "confirm",
-
-    # who is admin (role name OR Discord admin permission)
-    "admin_role_name": "Administrator",
-
-    # allowlist users (ids) and roles for admin planner (in #ai-admin)
-    "ai_admin_allow_users": "[]",
-    "ai_admin_allow_roles": "[\"AI Admin\",\"Administrator\"]",
-
-    # safety
-    "protected_role_names": "[\"Administrator\"]",
-    "protected_category_names": "[\"AI ADMIN\"]",
-    "protected_channel_names": "[\"ai-admin\",\"ai-audit-log\"]",
-    "max_actions_per_request": "5",
-
-    # model selection
-    "model_free": "gpt-4o-mini",
-    "model_pro": "gpt-4o",
-    "model_admin": "gpt-4o",
-
-    # premium tiers (optional): role -> {model, daily_limit}
-    "premium_tiers": "{\"Nexora Pro\":{\"model\":\"gpt-4o-mini\",\"daily_limit\":200},"
-                     "\"Nexora Elite\":{\"model\":\"gpt-4o\",\"daily_limit\":500},"
-                     "\"Nexora Ultra\":{\"model\":\"gpt-4o\",\"daily_limit\":null}}",
-
-    # enabled actions (can toggle on/off without code)
-    "enabled_actions": "{}",
-}
-
-ALL_ACTIONS = [
-    "create_text_channel",
-    "create_voice_channel",
-    "delete_channel",
-    "rename_channel",
-    "move_channel",
-    "create_category",
-    "delete_category",
-    "create_role",
-    "delete_role",
-    "add_role_to_user",
-    "remove_role_from_user",
-    "set_channel_permissions",
-    "set_slowmode",
-    "lock_channel",
-    "unlock_channel",
-    "timeout_user",
-    "kick_user",
-    "ban_user",
-    "unban_user",
-
-    # UPGRADE:
-    "send_message",            # {channel, content, pin?:true|false}
-    "pin_last_bot_message",    # {channel}
-]
-
-DEFAULT_ENABLED_ACTIONS = {
-    "create_text_channel": True,
-    "create_voice_channel": True,
-    "create_category": True,
-    "create_role": True,
-    "add_role_to_user": True,
-    "remove_role_from_user": True,
-    "set_channel_permissions": True,
-    "set_slowmode": True,
-    "rename_channel": True,
-    "move_channel": True,
-    "lock_channel": True,
-    "unlock_channel": True,
-
-    # destructive / higher risk - start off disabled, you can enable later:
-    "delete_channel": False,
-    "delete_category": False,
-    "delete_role": False,
-    "timeout_user": True,
-    "kick_user": False,
-    "ban_user": False,
-    "unban_user": False,
-
-    # UPGRADE:
-    "send_message": True,
-    "pin_last_bot_message": True,
-}
-
+client_ai = OpenAI(api_key=OPENAI_API_KEY)
 
 # =========================
-# DB
+# Helpers: language
 # =========================
-def db() -> sqlite3.Connection:
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    return con
+UA_CHARS = set("іїєґІЇЄҐ")
 
-def init_db():
-    con = db()
-    cur = con.cursor()
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS settings(
-        guild_id TEXT NOT NULL,
-        key TEXT NOT NULL,
-        value TEXT NOT NULL,
-        PRIMARY KEY(guild_id, key)
-    )
-    """)
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS usage_daily(
-        guild_id TEXT NOT NULL,
-        user_id TEXT NOT NULL,
-        day TEXT NOT NULL,
-        count INTEGER NOT NULL,
-        PRIMARY KEY(guild_id, user_id, day)
-    )
-    """)
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS pending_admin(
-        guild_id TEXT NOT NULL,
-        request_id TEXT NOT NULL,
-        requester_id TEXT NOT NULL,
-        channel_id TEXT NOT NULL,
-        payload_json TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        PRIMARY KEY(guild_id, request_id)
-    )
-    """)
-    con.commit()
-    con.close()
+def detect_lang(text: str) -> str:
+    # very simple heuristic: UA chars -> uk, Cyrillic -> ru, else en
+    if any(ch in UA_CHARS for ch in text):
+        return "uk"
+    if re.search(r"[А-Яа-яЁё]", text):
+        return "ru"
+    return "en"
 
-def parse_json(raw: str, fallback):
-    try:
-        return json.loads(raw)
-    except Exception:
-        return fallback
+def t(lang: str, ru: str, en: str, uk: Optional[str] = None) -> str:
+    if lang == "ru":
+        return ru
+    if lang == "uk":
+        return uk or ru
+    return en
 
-def get_setting(guild_id: int, key: str) -> str:
-    con = db()
-    cur = con.cursor()
-    cur.execute("SELECT value FROM settings WHERE guild_id=? AND key=?", (str(guild_id), key))
-    row = cur.fetchone()
-    if row:
-        con.close()
-        return row["value"]
+# =========================
+# SQLite: usage tracking + settings
+# =========================
+async def db_init():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS user_usage (
+            user_id INTEGER NOT NULL,
+            day TEXT NOT NULL,
+            count INTEGER NOT NULL,
+            PRIMARY KEY(user_id, day)
+        );
+        """)
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS kv (
+            k TEXT PRIMARY KEY,
+            v TEXT NOT NULL
+        );
+        """)
+        await db.commit()
 
-    # seed missing
-    if key == "enabled_actions":
-        value = json.dumps(DEFAULT_ENABLED_ACTIONS)
-    else:
-        value = DEFAULTS.get(key, "")
-    cur.execute("INSERT OR REPLACE INTO settings(guild_id, key, value) VALUES(?,?,?)",
-                (str(guild_id), key, str(value)))
-    con.commit()
-    con.close()
-    return str(value)
+async def db_get_kv(key: str, default: str) -> str:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT v FROM kv WHERE k=?", (key,)) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else default
 
-def set_setting(guild_id: int, key: str, value: str):
-    con = db()
-    cur = con.cursor()
-    cur.execute("INSERT OR REPLACE INTO settings(guild_id, key, value) VALUES(?,?,?)",
-                (str(guild_id), key, str(value)))
-    con.commit()
-    con.close()
+async def db_set_kv(key: str, value: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (key, value))
+        await db.commit()
+
+async def db_get_usage(user_id: int, day: str) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT count FROM user_usage WHERE user_id=? AND day=?", (user_id, day)) as cur:
+            row = await cur.fetchone()
+            return int(row[0]) if row else 0
+
+async def db_inc_usage(user_id: int, day: str, inc: int = 1) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT count FROM user_usage WHERE user_id=? AND day=?", (user_id, day))
+        row = await cur.fetchone()
+        current = int(row[0]) if row else 0
+        new_val = current + inc
+        await db.execute(
+            "INSERT INTO user_usage(user_id, day, count) VALUES(?,?,?) ON CONFLICT(user_id, day) DO UPDATE SET count=?",
+            (user_id, day, new_val, new_val)
+        )
+        await db.commit()
+        return new_val
 
 def today_key() -> str:
-    return datetime.datetime.utcnow().strftime("%Y-%m-%d")
-
-def usage_get(guild_id: int, user_id: int) -> int:
-    con = db()
-    cur = con.cursor()
-    cur.execute("SELECT count FROM usage_daily WHERE guild_id=? AND user_id=? AND day=?",
-                (str(guild_id), str(user_id), today_key()))
-    row = cur.fetchone()
-    con.close()
-    return int(row["count"]) if row else 0
-
-def usage_inc(guild_id: int, user_id: int, delta: int = 1):
-    con = db()
-    cur = con.cursor()
-    day = today_key()
-    cur.execute("SELECT count FROM usage_daily WHERE guild_id=? AND user_id=? AND day=?",
-                (str(guild_id), str(user_id), day))
-    row = cur.fetchone()
-    if row:
-        cur.execute("UPDATE usage_daily SET count=? WHERE guild_id=? AND user_id=? AND day=?",
-                    (int(row["count"]) + delta, str(guild_id), str(user_id), day))
-    else:
-        cur.execute("INSERT INTO usage_daily(guild_id, user_id, day, count) VALUES(?,?,?,?)",
-                    (str(guild_id), str(user_id), day, delta))
-    con.commit()
-    con.close()
-
-def pending_put(guild_id: int, request_id: str, requester_id: int, channel_id: int, payload: Dict[str, Any]):
-    con = db()
-    cur = con.cursor()
-    cur.execute("""
-    INSERT OR REPLACE INTO pending_admin(guild_id, request_id, requester_id, channel_id, payload_json, created_at)
-    VALUES(?,?,?,?,?,?)
-    """, (str(guild_id), request_id, str(requester_id), str(channel_id),
-          json.dumps(payload, ensure_ascii=False), datetime.datetime.utcnow().isoformat()))
-    con.commit()
-    con.close()
-
-def pending_get(guild_id: int, request_id: str) -> Optional[sqlite3.Row]:
-    con = db()
-    cur = con.cursor()
-    cur.execute("SELECT * FROM pending_admin WHERE guild_id=? AND request_id=?",
-                (str(guild_id), request_id))
-    row = cur.fetchone()
-    con.close()
-    return row
-
-def pending_del(guild_id: int, request_id: str):
-    con = db()
-    cur = con.cursor()
-    cur.execute("DELETE FROM pending_admin WHERE guild_id=? AND request_id=?",
-                (str(guild_id), request_id))
-    con.commit()
-    con.close()
-
+    return dt.datetime.utcnow().date().isoformat()
 
 # =========================
-# DISCORD BOT
+# Discord bot setup
 # =========================
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 intents.guilds = True
+
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-
 # =========================
-# UTIL / SAFETY
+# Permissions / identity checks
 # =========================
-def is_admin(member: discord.Member, admin_role_name: str) -> bool:
-    return member.guild_permissions.administrator or any(r.name == admin_role_name for r in member.roles)
-
-def get_enabled_actions(guild_id: int) -> Dict[str, bool]:
-    raw = get_setting(guild_id, "enabled_actions")
-    data = parse_json(raw, {})
-    out = dict(DEFAULT_ENABLED_ACTIONS)
-    out.update({k: bool(v) for k, v in data.items()})
-    return out
-
-def set_enabled_action(guild_id: int, action: str, enabled: bool):
-    cur = get_enabled_actions(guild_id)
-    cur[action] = bool(enabled)
-    set_setting(guild_id, "enabled_actions", json.dumps(cur))
-
-def is_ai_admin_allowed(guild: discord.Guild, member: discord.Member) -> bool:
-    allow_users = parse_json(get_setting(guild.id, "ai_admin_allow_users"), [])
-    allow_roles = parse_json(get_setting(guild.id, "ai_admin_allow_roles"), [])
-    allow_users = {int(x) for x in allow_users if str(x).isdigit()}
-    allow_roles = {str(x) for x in allow_roles}
-
-    if member.id in allow_users:
+def is_admin_member(member: discord.Member) -> bool:
+    if member.guild_permissions.administrator:
         return True
-    if is_admin(member, get_setting(guild.id, "admin_role_name")):
+    # AI Admin role grants admin access to admin channel logic
+    if discord.utils.get(member.roles, name="AI Admin") is not None:
         return True
-    if any(r.name in allow_roles for r in member.roles):
+    if AI_ADMIN_ALLOWLIST and member.id in AI_ADMIN_ALLOWLIST:
         return True
     return False
 
-def is_protected_role(guild: discord.Guild, role_name: str) -> bool:
-    protected = set(parse_json(get_setting(guild.id, "protected_role_names"), []))
-    if role_name == "@everyone":
-        return True
-    return role_name in protected
+def is_free_limited(member: discord.Member) -> bool:
+    # Admins unlimited
+    if is_admin_member(member):
+        return False
+    # If user has paid roles, also unlimited (you can adjust)
+    paid = {"Nexora Pro", "Nexora Elite", "Nexora Ultra"}
+    if any(r.name in paid for r in member.roles):
+        return False
+    # everyone else limited (Visitor/Member/etc.)
+    return True
 
-def is_protected_category(guild: discord.Guild, category_name: str) -> bool:
-    protected = set(parse_json(get_setting(guild.id, "protected_category_names"), []))
-    return category_name in protected
+def channel_name(ch: discord.abc.GuildChannel) -> str:
+    return getattr(ch, "name", "")
 
-def is_protected_channel_name(guild: discord.Guild, channel_name: str) -> bool:
-    protected = set(parse_json(get_setting(guild.id, "protected_channel_names"), []))
-    return channel_name in protected
+def bot_is_mentioned(msg: discord.Message) -> bool:
+    return bot.user is not None and bot.user in msg.mentions
 
-async def find_text_channel_by_name(guild: discord.Guild, name: str) -> Optional[discord.TextChannel]:
-    for ch in guild.text_channels:
-        if ch.name == name:
-            return ch
-    return None
-
-async def audit_log(guild: discord.Guild, text: str):
-    ch_name = get_setting(guild.id, "ai_audit_channel")
-    ch = await find_text_channel_by_name(guild, ch_name)
+# =========================
+# Audit logging
+# =========================
+async def audit_log(guild: discord.Guild, content: str):
+    ch = discord.utils.get(guild.text_channels, name=AI_AUDIT_CHANNEL_NAME)
     if ch:
-        await ch.send(text[:1900])
+        await ch.send(content)
 
-def strip_bot_mention(text: str) -> str:
-    if bot.user:
-        text = text.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "")
-    return text.strip()
+def fmt_plan_header(actor: discord.Member, plan_id: str, summary: str, risk: str) -> str:
+    return f"📝 **ADMIN PLAN** by {actor.mention} | {summary} | risk={risk} | id={plan_id}"
 
-def detect_lang_hint(text: str) -> str:
-    cyr = len(re.findall(r"[А-Яа-яЁёІіЇїЄєҐґ]", text))
-    lat = len(re.findall(r"[A-Za-z]", text))
-    if cyr > lat:
-        if re.search(r"[їєіґ]", text.lower()):
-            return "Ukrainian"
-        return "Russian"
-    if lat > cyr:
-        return "English"
-    return "User language"
-
+def fmt_exec_header(actor: discord.Member, summary: str) -> str:
+    return f"✅ **EXECUTED** by {actor.mention} | {summary}"
 
 # =========================
-# SERVER MAP
+# Tool actions (Discord operations)
 # =========================
-def build_server_map(guild: discord.Guild) -> str:
-    lines = []
-    for cat in sorted(guild.categories, key=lambda c: c.position):
-        lines.append(f"[CATEGORY] {cat.name}")
-        for ch in sorted(cat.channels, key=lambda c: c.position):
-            if isinstance(ch, discord.TextChannel):
-                lines.append(f"  # {ch.name}")
-            elif isinstance(ch, discord.VoiceChannel):
-                lines.append(f"  🔊 {ch.name}")
-            else:
-                lines.append(f"  - {ch.name}")
-    unc = [c for c in guild.channels if c.category is None]
-    if unc:
-        lines.append("[UNCATEGORIZED]")
-        for ch in sorted(unc, key=lambda c: c.position):
-            if isinstance(ch, discord.TextChannel):
-                lines.append(f"  # {ch.name}")
-            elif isinstance(ch, discord.VoiceChannel):
-                lines.append(f"  🔊 {ch.name}")
-            else:
-                lines.append(f"  - {ch.name}")
-    return "\n".join(lines)
+class ActionError(Exception):
+    pass
 
+async def resolve_channel(guild: discord.Guild, channel: str) -> discord.TextChannel:
+    # channel can be name or ID
+    if channel.isdigit():
+        ch = guild.get_channel(int(channel))
+        if isinstance(ch, discord.TextChannel):
+            return ch
+    # strip possible leading #
+    name = channel.lstrip("#")
+    ch = discord.utils.get(guild.text_channels, name=name)
+    if not ch:
+        raise ActionError(f"Channel not found: {channel}")
+    return ch
 
-# =========================
-# AI PROMPTS
-# =========================
-PUBLIC_SYSTEM = """You are Nexora AI (Discord server assistant).
-Rules:
-- Always respond in the user's language.
-- Free users: ONLY help about Nexora server (channels, rules, features, tickets, how to trade safely).
-- If user asks unrelated topics in free mode: politely refuse and say full AI access is available via subscription.
-- Be concise and give next-step instructions.
-"""
+async def resolve_role(guild: discord.Guild, role: str) -> discord.Role:
+    # special aliases for @everyone
+    if role.lower() in {"everyone", "@everyone", "default"}:
+        return guild.default_role
+    if role.isdigit():
+        r = guild.get_role(int(role))
+        if r:
+            return r
+    r = discord.utils.get(guild.roles, name=role)
+    if not r:
+        raise ActionError(f"Role not found: {role}")
+    return r
 
-PREMIUM_SYSTEM = """You are Nexora AI (premium assistant).
-Rules:
-- Always respond in the user's language.
-- You can discuss any topics, but if asked about Nexora server - provide practical steps.
-- Be concise and helpful.
-"""
+async def resolve_member(guild: discord.Guild, user: str) -> discord.Member:
+    # user can be mention, ID, or username
+    m = re.search(r"(\d{15,20})", user)
+    if m:
+        uid = int(m.group(1))
+        mem = guild.get_member(uid)
+        if mem:
+            return mem
+        try:
+            mem = await guild.fetch_member(uid)
+            return mem
+        except Exception:
+            pass
+    # try exact name / display name
+    for mem in guild.members:
+        if mem.name == user or mem.display_name == user:
+            return mem
+    raise ActionError(f"User not found: {user}")
 
-ADMIN_SYSTEM = """You are Nexora AI Admin Planner.
-Return ONLY valid JSON (no markdown).
+async def action_create_text_channel(guild: discord.Guild, name: str, category: Optional[str] = None) -> str:
+    cat_obj = None
+    if category:
+        cat_obj = discord.utils.get(guild.categories, name=category)
+        if not cat_obj:
+            raise ActionError(f"Category not found: {category}")
+    ch = await guild.create_text_channel(name=name, category=cat_obj)
+    return f"Created text channel: {ch.mention}"
 
-Goal: Convert the admin request into a safe executable plan.
+async def action_send_message(guild: discord.Guild, channel: str, content: str, pin: bool = False) -> str:
+    ch = await resolve_channel(guild, channel)
+    msg = await ch.send(content)
+    if pin:
+        try:
+            await msg.pin(reason="Nexora AI pin")
+        except discord.Forbidden:
+            raise ActionError(f"Sent message but failed to pin in {ch.mention}: Missing Permissions")
+    return f"Sent message to {ch.mention} (id={msg.id})" + (f" and pinned" if pin else "")
 
-Output schema:
-{
-  "summary": "short",
-  "risk": "low|medium|high",
-  "actions": [
-    {"type":"...", "params":{...}}
-  ],
-  "notes":"optional"
+async def action_pin_message(guild: discord.Guild, channel: str, message_id: str) -> str:
+    ch = await resolve_channel(guild, channel)
+    mid = int(message_id)
+    try:
+        msg = await ch.fetch_message(mid)
+    except Exception:
+        raise ActionError(f"Message not found in {ch.mention}: {message_id}")
+    try:
+        await msg.pin(reason="Nexora AI pin")
+    except discord.Forbidden:
+        raise ActionError("Missing Permissions to pin")
+    return f"Pinned message in {ch.mention} (id={msg.id})"
+
+async def action_delete_message(guild: discord.Guild, channel: str, message_id: str) -> str:
+    ch = await resolve_channel(guild, channel)
+    mid = int(message_id)
+    try:
+        msg = await ch.fetch_message(mid)
+    except Exception:
+        raise ActionError(f"Message not found in {ch.mention}: {message_id}")
+    try:
+        await msg.delete(reason="Nexora AI delete")
+    except discord.Forbidden:
+        raise ActionError("Missing Permissions to delete messages (Manage Messages)")
+    return f"Deleted message in {ch.mention} (id={mid})"
+
+async def action_add_role_to_user(guild: discord.Guild, user: str, role: str) -> str:
+    mem = await resolve_member(guild, user)
+    r = await resolve_role(guild, role)
+    try:
+        await mem.add_roles(r, reason="Nexora AI role grant")
+    except discord.Forbidden:
+        raise ActionError("Missing Permissions to manage roles or role hierarchy too low")
+    return f"Added role {r.name} to {mem.display_name}"
+
+async def action_remove_role_from_user(guild: discord.Guild, user: str, role: str) -> str:
+    mem = await resolve_member(guild, user)
+    r = await resolve_role(guild, role)
+    try:
+        await mem.remove_roles(r, reason="Nexora AI role remove")
+    except discord.Forbidden:
+        raise ActionError("Missing Permissions to manage roles or role hierarchy too low")
+    return f"Removed role {r.name} from {mem.display_name}"
+
+async def action_create_role(guild: discord.Guild, name: str) -> str:
+    existing = discord.utils.get(guild.roles, name=name)
+    if existing:
+        return f"Role already exists: {name}"
+    try:
+        r = await guild.create_role(name=name, reason="Nexora AI role create")
+    except discord.Forbidden:
+        raise ActionError("Missing Permissions to create roles")
+    return f"Created role: {r.name}"
+
+async def action_set_channel_permissions(
+    guild: discord.Guild,
+    channel: str,
+    role: str,
+    view: Optional[bool] = None,
+    send: Optional[bool] = None,
+    read_history: Optional[bool] = None,
+    manage_messages: Optional[bool] = None,
+) -> str:
+    ch = await resolve_channel(guild, channel)
+    r = await resolve_role(guild, role)
+
+    overwrite = ch.overwrites_for(r)
+    if view is not None:
+        overwrite.view_channel = view
+    if send is not None:
+        overwrite.send_messages = send
+    if read_history is not None:
+        overwrite.read_message_history = read_history
+    if manage_messages is not None:
+        overwrite.manage_messages = manage_messages
+
+    try:
+        await ch.set_permissions(r, overwrite=overwrite, reason="Nexora AI set perms")
+    except discord.Forbidden:
+        raise ActionError("Missing Permissions to edit channel permissions")
+    return f"Set perms in #{ch.name} for role {r.name}"
+
+# Registry for tool calls
+TOOL_FUNCS = {
+    "create_text_channel": action_create_text_channel,
+    "send_message": action_send_message,
+    "pin_message": action_pin_message,
+    "delete_message": action_delete_message,
+    "add_role_to_user": action_add_role_to_user,
+    "remove_role_from_user": action_remove_role_from_user,
+    "create_role": action_create_role,
+    "set_channel_permissions": action_set_channel_permissions,
 }
 
-Supported action types:
-- create_text_channel {name, category|null}
-- create_voice_channel {name, category|null}
-- delete_channel {channel}
-- rename_channel {channel, new_name}
-- move_channel {channel, category|null}
-- create_category {name, private:false|true}
-- delete_category {category}
-- create_role {name}
-- delete_role {name}
-- add_role_to_user {user, role}
-- remove_role_from_user {user, role}
-- set_channel_permissions {channel, role, view:true|false|null, send:true|false|null}
-- set_slowmode {channel, seconds:0..21600}
-- lock_channel {channel}
-- unlock_channel {channel}
-- timeout_user {user, minutes:1..10080, reason|null}
-- kick_user {user, reason|null}
-- ban_user {user, reason|null}
-- unban_user {user_id}
+# =========================
+# OpenAI function schema
+# =========================
+TOOLS_SCHEMA = [
+    {
+        "type": "function",
+        "function": {
+            "name": "create_text_channel",
+            "description": "Create a new text channel.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "category": {"type": ["string", "null"]},
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_message",
+            "description": "Send a message to a channel (optionally pin it).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "channel": {"type": "string", "description": "Channel name like 'welcome' or '#welcome' or channel ID."},
+                    "content": {"type": "string"},
+                    "pin": {"type": "boolean"},
+                },
+                "required": ["channel", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "pin_message",
+            "description": "Pin a message by ID in a channel.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "channel": {"type": "string"},
+                    "message_id": {"type": "string"},
+                },
+                "required": ["channel", "message_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_message",
+            "description": "Delete a message by ID in a channel.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "channel": {"type": "string"},
+                    "message_id": {"type": "string"},
+                },
+                "required": ["channel", "message_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_role_to_user",
+            "description": "Give a role to a user.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user": {"type": "string", "description": "User mention or user ID or name."},
+                    "role": {"type": "string", "description": "Role name or role ID. Use 'everyone' for @everyone."},
+                },
+                "required": ["user", "role"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remove_role_from_user",
+            "description": "Remove a role from a user.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user": {"type": "string"},
+                    "role": {"type": "string"},
+                },
+                "required": ["user", "role"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_role",
+            "description": "Create a new role.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_channel_permissions",
+            "description": "Set channel permission overrides for a role.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "channel": {"type": "string"},
+                    "role": {"type": "string"},
+                    "view": {"type": ["boolean", "null"]},
+                    "send": {"type": ["boolean", "null"]},
+                    "read_history": {"type": ["boolean", "null"]},
+                    "manage_messages": {"type": ["boolean", "null"]},
+                },
+                "required": ["channel", "role"],
+            },
+        },
+    },
+]
 
-UPGRADED:
-- send_message {channel, content, pin:true|false|null}
-- pin_last_bot_message {channel}
-
-Hard safety rules:
-- Never grant Administrator permission.
-- Never edit protected roles/categories/channels.
-- Only include actions that are enabled in enabled_actions.
-- Keep actions minimal (max few actions).
+SYSTEM_ADMIN = """You are Nexora AI Admin assistant for a Discord server.
+You MUST:
+- Produce a short PLAN summary, risk level (low/medium/high), and tool actions.
+- Only propose actions that are specific and executable.
+- If request is unclear, ask for clarification without tool calls.
+- Respect that some actions may fail if the bot lacks Discord permissions or role hierarchy.
+- Use role name 'everyone' to refer to @everyone default role.
+- Keep responses concise.
 """
 
+SYSTEM_CHAT = """You are Nexora AI assistant for a Discord server. Be helpful and concise.
+If the user asks for admin actions, tell them to use #ai-admin and mention the bot.
+"""
 
 # =========================
-# AI CALLS
+# UI: Confirm / Cancel
 # =========================
-def ai_text(model: str, system: str, user: str) -> str:
-    resp = ai.chat.completions.create(
-        model=model,
-        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-    )
-    return (resp.choices[0].message.content or "").strip()
-
-def ai_json(model: str, system: str, user: str) -> Dict[str, Any]:
-    try:
-        resp = ai.chat.completions.create(
-            model=model,
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-            response_format={"type": "json_object"},
-        )
-        return json.loads(resp.choices[0].message.content)
-    except Exception:
-        text = ai_text(model, system, user)
-        m = re.search(r"\{.*\}", text, re.S)
-        if not m:
-            raise
-        return json.loads(m.group(0))
-
-
-# =========================
-# RESOLVERS
-# =========================
-def parse_user_id(ref: str) -> Optional[int]:
-    if not ref:
-        return None
-    ref = str(ref).strip()
-    if ref.isdigit():
-        return int(ref)
-    if ref.startswith("<@") and ref.endswith(">"):
-        digits = "".join(ch for ch in ref if ch.isdigit())
-        if digits:
-            return int(digits)
-    m = re.search(r"(\d{15,20})", ref)
-    if m:
-        return int(m.group(1))
-    return None
-
-def resolve_channel(guild: discord.Guild, ref: Any) -> Optional[discord.abc.GuildChannel]:
-    if ref is None:
-        return None
-    if isinstance(ref, int) or (isinstance(ref, str) and str(ref).isdigit()):
-        return guild.get_channel(int(ref))
-    name = str(ref).strip().lstrip("#").lower()
-    for ch in guild.channels:
-        if getattr(ch, "name", "").lower() == name:
-            return ch
-    return None
-
-def resolve_category(guild: discord.Guild, ref: Any) -> Optional[discord.CategoryChannel]:
-    if ref is None:
-        return None
-    if isinstance(ref, int) or (isinstance(ref, str) and str(ref).isdigit()):
-        ch = guild.get_channel(int(ref))
-        return ch if isinstance(ch, discord.CategoryChannel) else None
-    name = str(ref).strip().lower()
-    for c in guild.categories:
-        if c.name.lower() == name:
-            return c
-    return None
-
-def resolve_role(guild: discord.Guild, name: str) -> Optional[discord.Role]:
-    if not name:
-        return None
-    for r in guild.roles:
-        if r.name.lower() == name.lower():
-            return r
-    return None
-
-
-# =========================
-# ACTION EXECUTION
-# =========================
-async def execute_action(guild: discord.Guild, action: Dict[str, Any]) -> Tuple[bool, str]:
-    enabled = get_enabled_actions(guild.id)
-    a_type = (action.get("type") or "").strip()
-    params = action.get("params") or {}
-
-    if a_type not in ALL_ACTIONS:
-        return False, f"Unknown action: {a_type}"
-    if not enabled.get(a_type, False):
-        return False, f"Action disabled: {a_type}"
-
-    prot_ch = set(parse_json(get_setting(guild.id, "protected_channel_names"), []))
-    prot_cat = set(parse_json(get_setting(guild.id, "protected_category_names"), []))
-
-    def channel_is_protected(ch: discord.abc.GuildChannel) -> bool:
-        return hasattr(ch, "name") and (ch.name in prot_ch)
-
-    def category_is_protected(cat: discord.CategoryChannel) -> bool:
-        return cat.name in prot_cat
-
-    async def ensure_bot_role_higher_than(role: discord.Role) -> Optional[str]:
-        me = guild.me
-        if me and role >= me.top_role:
-            return f"Bot role must be higher than target role: {role.name}"
-        return None
-
-    # ---- create_category
-    if a_type == "create_category":
-        name = str(params.get("name") or "").strip()
-        private = bool(params.get("private", False))
-        if not name:
-            return False, "Missing category name"
-        if is_protected_category(guild, name):
-            return False, f"Protected category: {name}"
-        overwrites = None
-        if private:
-            overwrites = {guild.default_role: discord.PermissionOverwrite(view_channel=False)}
-        cat = await guild.create_category(name=name, overwrites=overwrites)
-        return True, f"Created category: {cat.name}"
-
-    # ---- delete_category
-    if a_type == "delete_category":
-        cat_ref = params.get("category")
-        cat = resolve_category(guild, cat_ref)
-        if not cat:
-            return False, f"Category not found: {cat_ref}"
-        if category_is_protected(cat) or is_protected_category(guild, cat.name):
-            return False, f"Protected category: {cat.name}"
-        await cat.delete()
-        return True, f"Deleted category: {cat.name}"
-
-    # ---- create_text_channel / voice
-    if a_type in ("create_text_channel", "create_voice_channel"):
-        name = str(params.get("name") or "").strip().lstrip("#")
-        cat_ref = params.get("category", None)
-        if not name:
-            return False, "Missing channel name"
-        category = resolve_category(guild, cat_ref) if cat_ref else None
-        if category and category_is_protected(category):
-            return False, f"Target category protected: {category.name}"
-
-        if a_type == "create_text_channel":
-            ch = await guild.create_text_channel(name=name, category=category)
-            return True, f"Created text channel: #{ch.name}"
-        else:
-            ch = await guild.create_voice_channel(name=name, category=category)
-            return True, f"Created voice channel: {ch.name}"
-
-    # ---- delete_channel
-    if a_type == "delete_channel":
-        ch = resolve_channel(guild, params.get("channel"))
-        if not ch:
-            return False, "Channel not found"
-        if channel_is_protected(ch) or is_protected_channel_name(guild, getattr(ch, "name", "")):
-            return False, f"Protected channel: {getattr(ch, 'name', ch.id)}"
-        if isinstance(ch, (discord.TextChannel, discord.VoiceChannel)) and ch.category:
-            if category_is_protected(ch.category):
-                return False, f"Channel is in protected category: {ch.category.name}"
-        await ch.delete()
-        return True, f"Deleted channel: {getattr(ch, 'name', ch.id)}"
-
-    # ---- rename_channel
-    if a_type == "rename_channel":
-        ch = resolve_channel(guild, params.get("channel"))
-        new_name = str(params.get("new_name") or "").strip().lstrip("#")
-        if not ch or not new_name:
-            return False, "Missing channel or new_name"
-        if channel_is_protected(ch):
-            return False, f"Protected channel: {getattr(ch, 'name', ch.id)}"
-        await ch.edit(name=new_name)
-        return True, f"Renamed channel to: {new_name}"
-
-    # ---- move_channel
-    if a_type == "move_channel":
-        ch = resolve_channel(guild, params.get("channel"))
-        cat_ref = params.get("category", None)
-        if not ch:
-            return False, "Missing channel"
-        if channel_is_protected(ch):
-            return False, f"Protected channel: {getattr(ch, 'name', ch.id)}"
-        category = resolve_category(guild, cat_ref) if cat_ref else None
-        if category and category_is_protected(category):
-            return False, f"Target category protected: {category.name}"
-        await ch.edit(category=category)
-        return True, f"Moved channel: {getattr(ch, 'name', ch.id)}"
-
-    # ---- create_role / delete_role
-    if a_type == "create_role":
-        name = str(params.get("name") or "").strip()
-        if not name:
-            return False, "Missing role name"
-        if is_protected_role(guild, name):
-            return False, f"Protected role name: {name}"
-        if resolve_role(guild, name):
-            return True, f"Role already exists: {name}"
-        role = await guild.create_role(name=name, permissions=discord.Permissions.none())
-        return True, f"Created role: {role.name}"
-
-    if a_type == "delete_role":
-        name = str(params.get("name") or "").strip()
-        if not name:
-            return False, "Missing role name"
-        if is_protected_role(guild, name):
-            return False, f"Protected role: {name}"
-        role = resolve_role(guild, name)
-        if not role:
-            return False, f"Role not found: {name}"
-        if role.managed:
-            return False, f"Managed role can't be deleted: {name}"
-        err = await ensure_bot_role_higher_than(role)
-        if err:
-            return False, err
-        await role.delete()
-        return True, f"Deleted role: {name}"
-
-    # ---- add/remove role to user
-    if a_type in ("add_role_to_user", "remove_role_from_user"):
-        uid = parse_user_id(str(params.get("user") or ""))
-        role_name = str(params.get("role") or "").strip()
-        if not uid or not role_name:
-            return False, "Missing user or role"
-        if is_protected_role(guild, role_name):
-            return False, f"Protected role: {role_name}"
-        member = guild.get_member(uid)
-        if not member:
-            return False, f"User not found in guild: {uid}"
-        role = resolve_role(guild, role_name)
-        if not role:
-            return False, f"Role not found: {role_name}"
-        err = await ensure_bot_role_higher_than(role)
-        if err:
-            return False, err
-
-        if a_type == "add_role_to_user":
-            await member.add_roles(role, reason="Nexora AI Admin")
-            return True, f"Added role {role.name} to {member.display_name}"
-        else:
-            await member.remove_roles(role, reason="Nexora AI Admin")
-            return True, f"Removed role {role.name} from {member.display_name}"
-
-    # ---- permissions
-    if a_type == "set_channel_permissions":
-        ch = resolve_channel(guild, params.get("channel"))
-        role_name = str(params.get("role") or "").strip()
-        view = params.get("view", None)
-        send = params.get("send", None)
-
-        if not ch or not role_name:
-            return False, "Missing channel or role"
-        if is_protected_role(guild, role_name):
-            return False, f"Protected role: {role_name}"
-        if channel_is_protected(ch):
-            return False, f"Protected channel: {getattr(ch, 'name', ch.id)}"
-
-        role = resolve_role(guild, role_name)
-        if not role:
-            return False, f"Role not found: {role_name}"
-
-        overwrite = ch.overwrites_for(role)  # type: ignore
-        if view is not None:
-            overwrite.view_channel = bool(view)
-        if send is not None:
-            overwrite.send_messages = bool(send)
-
-        await ch.set_permissions(role, overwrite=overwrite)  # type: ignore
-        return True, f"Updated permissions in {getattr(ch, 'name', ch.id)} for role {role.name}"
-
-    # ---- slowmode
-    if a_type == "set_slowmode":
-        ch = resolve_channel(guild, params.get("channel"))
-        seconds = params.get("seconds")
-        if not isinstance(ch, discord.TextChannel):
-            return False, "Slowmode applies to text channels only"
-        if channel_is_protected(ch):
-            return False, f"Protected channel: {ch.name}"
-        try:
-            sec = int(seconds)
-            if sec < 0 or sec > 21600:
-                return False, "seconds out of range (0..21600)"
-        except Exception:
-            return False, "Invalid seconds"
-        await ch.edit(slowmode_delay=sec)
-        return True, f"Set slowmode #{ch.name} to {sec}s"
-
-    # ---- lock/unlock channel
-    if a_type in ("lock_channel", "unlock_channel"):
-        ch = resolve_channel(guild, params.get("channel"))
-        if not isinstance(ch, discord.TextChannel):
-            return False, "Lock/unlock applies to text channels only"
-        if channel_is_protected(ch):
-            return False, f"Protected channel: {ch.name}"
-
-        everyone = guild.default_role
-        overwrite = ch.overwrites_for(everyone)
-        overwrite.send_messages = False if a_type == "lock_channel" else None
-        await ch.set_permissions(everyone, overwrite=overwrite)
-        return True, f"{'Locked' if a_type=='lock_channel' else 'Unlocked'} #{ch.name} for @everyone"
-
-    # ---- moderation
-    if a_type == "timeout_user":
-        uid = parse_user_id(str(params.get("user") or ""))
-        minutes = params.get("minutes")
-        reason = params.get("reason", None)
-        if not uid:
-            return False, "Missing user"
-        member = guild.get_member(uid)
-        if not member:
-            return False, f"User not found: {uid}"
-        try:
-            m = int(minutes)
-            if m < 1 or m > 10080:
-                return False, "minutes out of range (1..10080)"
-        except Exception:
-            return False, "Invalid minutes"
-        until = datetime.datetime.utcnow() + datetime.timedelta(minutes=m)
-        await member.timeout(until, reason=str(reason) if reason else "Nexora AI timeout")
-        return True, f"Timed out {member.display_name} for {m} minutes"
-
-    if a_type == "kick_user":
-        uid = parse_user_id(str(params.get("user") or ""))
-        reason = params.get("reason", None)
-        if not uid:
-            return False, "Missing user"
-        member = guild.get_member(uid)
-        if not member:
-            return False, f"User not found: {uid}"
-        await member.kick(reason=str(reason) if reason else "Nexora AI kick")
-        return True, f"Kicked {member.display_name}"
-
-    if a_type == "ban_user":
-        uid = parse_user_id(str(params.get("user") or ""))
-        reason = params.get("reason", None)
-        if not uid:
-            return False, "Missing user"
-        member = guild.get_member(uid)
-        if not member:
-            return False, f"User not found: {uid}"
-        await member.ban(reason=str(reason) if reason else "Nexora AI ban", delete_message_days=0)
-        return True, f"Banned {member.display_name}"
-
-    if a_type == "unban_user":
-        uid = params.get("user_id")
-        if not uid or not str(uid).isdigit():
-            return False, "Invalid user_id"
-        user = discord.Object(id=int(uid))
-        await guild.unban(user, reason="Nexora AI unban")
-        return True, f"Unbanned user id {uid}"
-
-    # =========================
-    # UPGRADE: send_message + pin
-    # =========================
-    if a_type == "send_message":
-        ch = resolve_channel(guild, params.get("channel"))
-        content = str(params.get("content") or "").strip()
-        pin = params.get("pin", None)
-
-        if not isinstance(ch, discord.TextChannel):
-            return False, "send_message: channel must be a text channel"
-        if not content:
-            return False, "send_message: empty content"
-        if channel_is_protected(ch) or is_protected_channel_name(guild, ch.name):
-            return False, f"Protected channel: #{ch.name}"
-
-        msg = await ch.send(content[:1900])
-        if pin is True:
-            try:
-                await msg.pin(reason="Nexora AI pin")
-                return True, f"Sent + pinned message in #{ch.name} (id={msg.id})"
-            except Exception as e:
-                return False, f"Sent message but failed to pin in #{ch.name}: {e}"
-        return True, f"Sent message to #{ch.name} (id={msg.id})"
-
-    if a_type == "pin_last_bot_message":
-        ch = resolve_channel(guild, params.get("channel"))
-        if not isinstance(ch, discord.TextChannel):
-            return False, "pin_last_bot_message: channel must be a text channel"
-        if channel_is_protected(ch) or is_protected_channel_name(guild, ch.name):
-            return False, f"Protected channel: #{ch.name}"
-
-        if not bot.user:
-            return False, "Bot user not ready"
-
-        async for m in ch.history(limit=50):
-            if m.author and m.author.id == bot.user.id:
-                try:
-                    await m.pin(reason="Nexora AI pin")
-                    return True, f"Pinned bot message in #{ch.name} (id={m.id})"
-                except Exception as e:
-                    return False, f"Failed to pin in #{ch.name}: {e}"
-        return False, f"No recent bot message found in #{ch.name} to pin"
-
-    return False, f"Unhandled action: {a_type}"
-
-
-# =========================
-# CONFIRMATION VIEW
-# =========================
-class ConfirmView(discord.ui.View):
-    def __init__(self, guild_id: int, request_id: str, requester_id: int):
-        super().__init__(timeout=600)
-        self.guild_id = guild_id
-        self.request_id = request_id
-        self.requester_id = requester_id
+class PlanView(discord.ui.View):
+    def __init__(self, *, actor_id: int, plan: Dict[str, Any], timeout: int = 120):
+        super().__init__(timeout=timeout)
+        self.actor_id = actor_id
+        self.plan = plan
+        self.result_message: Optional[discord.Message] = None
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.requester_id:
-            await interaction.response.send_message("❌ Только автор может подтверждать.", ephemeral=True)
+        if interaction.user.id != self.actor_id:
+            await interaction.response.send_message("Only the requesting admin can confirm/cancel this plan.", ephemeral=True)
             return False
         return True
 
-    @discord.ui.button(label="✅ Confirm", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.success)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        row = pending_get(self.guild_id, self.request_id)
-        if not row:
-            await interaction.response.send_message("❌ Запрос не найден/истёк.", ephemeral=True)
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        if ADMIN_MODE == "lock":
+            await interaction.followup.send("ADMIN_MODE=lock. Execution disabled.", ephemeral=True)
             return
 
         guild = interaction.guild
-        payload = json.loads(row["payload_json"])
-        actions = payload.get("actions", [])
-
-        mode = get_setting(guild.id, "admin_mode").lower().strip()
-        if mode == "lock":
-            await interaction.response.send_message("🔒 LOCK MODE: выполнение запрещено.", ephemeral=True)
-            return
-        if mode == "preview":
-            await interaction.response.send_message("🧪 PREVIEW MODE: выполнение отключено. Поставь /ai-admin-mode confirm.", ephemeral=True)
+        if not guild:
+            await interaction.followup.send("No guild context.", ephemeral=True)
             return
 
-        await interaction.response.send_message("⏳ Выполняю...", ephemeral=True)
+        actions: List[Dict[str, Any]] = self.plan.get("actions", [])
+        summary = self.plan.get("summary", "Execute plan")
 
         results = []
         for a in actions:
-            ok, msg = await execute_action(guild, a)
-            results.append(("✅ " if ok else "❌ ") + msg)
+            name = a.get("name")
+            args = a.get("arguments", {})
+            fn = TOOL_FUNCS.get(name)
+            if not fn:
+                results.append(f"❌ Unknown action: {name}")
+                continue
+            try:
+                out = await fn(guild, **args)
+                results.append(f"✅ {out}")
+            except ActionError as e:
+                results.append(f"❌ {name}: {e}")
+            except Exception as e:
+                results.append(f"❌ {name}: {type(e).__name__}: {e}")
 
-        pending_del(self.guild_id, self.request_id)
+        # audit
+        actor = guild.get_member(self.actor_id)
+        if actor:
+            await audit_log(guild, fmt_exec_header(actor, summary) + "\n" + "\n".join(f"• {r}" for r in results))
 
-        await audit_log(guild, f"✅ EXECUTED by <@{interaction.user.id}> | {payload.get('summary','(no summary)')}\n- " +
-                       "\n- ".join(results))
+        await interaction.followup.send("Done:\n" + "\n".join(results), ephemeral=True)
+        self.stop()
 
-        await interaction.followup.send("Готово:\n- " + "\n- ".join(results), ephemeral=True)
-
-    @discord.ui.button(label="🛑 Cancel", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        pending_del(self.guild_id, self.request_id)
-        await audit_log(interaction.guild, f"🛑 CANCELED by <@{interaction.user.id}> | request {self.request_id}")
-        await interaction.response.send_message("🛑 Отменено.", ephemeral=True)
-
+        await interaction.response.send_message("Cancelled.", ephemeral=True)
+        self.stop()
 
 # =========================
-# ADMIN PLANNING CORE (shared)
+# OpenAI: build plan with tool calls
 # =========================
-async def run_admin_planner(
-    guild: discord.Guild,
-    member: discord.Member,
-    channel: discord.TextChannel,
-    task: str,
-    respond_fn,   # async function(text, view=None)
-):
-    mode = get_setting(guild.id, "admin_mode").lower().strip()
-    if mode == "lock":
-        await respond_fn("🔒 LOCK MODE: выполнение запрещено. Можно только preview.", view=None)
-        return
-
-    enabled_actions = get_enabled_actions(guild.id)
-    enabled_list = [k for k, v in enabled_actions.items() if v]
-
-    server_map = build_server_map(guild)
-
-    max_actions = int(get_setting(guild.id, "max_actions_per_request") or "5")
-    protected_roles = parse_json(get_setting(guild.id, "protected_role_names"), [])
-    protected_cats = parse_json(get_setting(guild.id, "protected_category_names"), [])
-    protected_channels = parse_json(get_setting(guild.id, "protected_channel_names"), [])
-
-    prompt = (
-        ADMIN_SYSTEM +
-        "\n\nContext:\n"
-        f"- enabled_actions: {enabled_list}\n"
-        f"- protected_roles: {protected_roles}\n"
-        f"- protected_categories: {protected_cats}\n"
-        f"- protected_channels: {protected_channels}\n"
-        f"- max_actions: {max_actions}\n"
-        f"\nServer map:\n{server_map}\n"
-        f"\nAdmin request:\n{task}\n"
+async def build_admin_plan(user_text: str) -> Dict[str, Any]:
+    # Use function calling; we ask the model to propose tool calls
+    # We request JSON in normal message + tool calls in assistant
+    resp = client_ai.responses.create(
+        model="gpt-4.1-mini",
+        input=[
+            {"role": "system", "content": SYSTEM_ADMIN},
+            {"role": "user", "content": user_text},
+        ],
+        tools=TOOLS_SCHEMA,
+        tool_choice="auto",
     )
 
+    # Parse tool calls from response output
+    actions = []
+    summary = "Admin request"
+    risk = "low"
+    notes = ""
+
+    # The Responses API returns items in resp.output; we will extract:
+    # - assistant text (for summary/risk/notes)
+    # - tool calls (function calls)
+    for item in resp.output:
+        if item.type == "message":
+            # plain text
+            for c in item.content:
+                if c.type == "output_text":
+                    text = c.text.strip()
+                    # Attempt to parse summary/risk/notes from text
+                    # Accept formats like:
+                    # Summary: ...
+                    # Risk: low
+                    # Notes: ...
+                    m_sum = re.search(r"Summary:\s*(.*)", text, re.IGNORECASE)
+                    m_risk = re.search(r"Risk:\s*(low|medium|high)", text, re.IGNORECASE)
+                    m_notes = re.search(r"Notes:\s*(.*)", text, re.IGNORECASE)
+                    if m_sum:
+                        summary = m_sum.group(1).strip()
+                    if m_risk:
+                        risk = m_risk.group(1).lower()
+                    if m_notes:
+                        notes = m_notes.group(1).strip()
+        if item.type == "function_call":
+            try:
+                args = json.loads(item.arguments or "{}")
+            except Exception:
+                args = {}
+            actions.append({"name": item.name, "arguments": args})
+
+    if not actions:
+        # If the model didn't produce tool calls, treat as unclear informational.
+        if not notes:
+            notes = "No actionable request detected. Provide more specific instructions."
+        # keep empty actions; UI will show plan with no actions
+    return {"summary": summary, "risk": risk, "notes": notes, "actions": actions}
+
+# =========================
+# Chat response (non-admin)
+# =========================
+async def ai_chat_response(user_text: str, lang: str) -> str:
+    resp = client_ai.responses.create(
+        model="gpt-4.1-mini",
+        input=[
+            {"role": "system", "content": SYSTEM_CHAT},
+            {"role": "user", "content": user_text},
+        ],
+    )
+    # extract text
+    out = ""
+    for item in resp.output:
+        if item.type == "message":
+            for c in item.content:
+                if c.type == "output_text":
+                    out += c.text
+    out = out.strip() or t(lang, "Я не понял запрос.", "I didn't understand the request.", "Я не зрозуміла запит.")
+    return out
+
+# =========================
+# Ensure channels exist (optional)
+# =========================
+async def ensure_core_channels(guild: discord.Guild):
+    # Create audit/admin/support channels if missing
+    need = [AI_ADMIN_CHANNEL_NAME, AI_AUDIT_CHANNEL_NAME] + AI_FREE_CHAT_CHANNELS
+    existing = {c.name for c in guild.text_channels}
+    for name in need:
+        if name not in existing:
+            try:
+                await guild.create_text_channel(name=name, reason="Nexora AI bootstrap")
+            except discord.Forbidden:
+                # ignore if can't
+                pass
+
+# =========================
+# Events
+# =========================
+@bot.event
+async def on_ready():
+    await db_init()
     try:
-        model_admin = get_setting(guild.id, "model_admin")
-        plan = ai_json(model_admin, prompt, task)
-
-        actions = plan.get("actions", [])
-        if not isinstance(actions, list):
-            actions = []
-
-        safe_actions = []
-        for a in actions[:max_actions]:
-            if not isinstance(a, dict):
-                continue
-            t = (a.get("type") or "").strip()
-            if t not in ALL_ACTIONS:
-                continue
-            if not enabled_actions.get(t, False):
-                continue
-
-            params = a.get("params") or {}
-
-            # protect role names
-            if t in ("create_role", "delete_role", "add_role_to_user", "remove_role_from_user", "set_channel_permissions"):
-                role_name = str(params.get("role") or params.get("name") or "")
-                if role_name and is_protected_role(guild, role_name):
-                    continue
-
-            # protect category names
-            if t in ("create_category", "delete_category"):
-                cname = str(params.get("name") or params.get("category") or "")
-                if cname and is_protected_category(guild, cname):
-                    continue
-
-            # protect channels by name
-            if t in (
-                "delete_channel", "rename_channel", "lock_channel", "unlock_channel",
-                "set_slowmode", "move_channel", "set_channel_permissions",
-                "send_message", "pin_last_bot_message"
-            ):
-                chref = str(params.get("channel") or "")
-                if chref:
-                    nm = chref.strip().lstrip("#")
-                    if nm in protected_channels:
-                        continue
-
-            safe_actions.append({"type": t, "params": params})
-
-        plan["actions"] = safe_actions
-
-        request_id = str(uuid.uuid4())[:8]
-        pending_put(guild.id, request_id, member.id, channel.id, plan)
-
-        summary = plan.get("summary", "(no summary)")
-        risk = plan.get("risk", "medium")
-        notes = plan.get("notes", "")
-
-        pretty = (
-            f"🧩 PLAN `{request_id}`\n"
-            f"Summary: {summary}\n"
-            f"Risk: {risk}\n"
-            f"Actions:\n" +
-            ("\n".join([f"- `{a['type']}` {a.get('params', {})}" for a in safe_actions]) if safe_actions else "- (no actions)") +
-            (f"\nNotes: {notes}" if notes else "")
-        )
-
-        await audit_log(guild, f"📝 ADMIN PLAN by <@{member.id}> | {summary} | risk={risk} | id={request_id}")
-
-        if mode == "preview":
-            await respond_fn(pretty[:1900], view=None)
-            return
-
-        if mode == "execute":
-            results = []
-            for a in safe_actions:
-                ok, msg = await execute_action(guild, a)
-                results.append(("✅ " if ok else "❌ ") + msg)
-            pending_del(guild.id, request_id)
-            await audit_log(guild, f"✅ EXECUTED (no-confirm) by <@{member.id}> | {summary}\n- " + "\n- ".join(results))
-            await respond_fn(pretty[:1200] + "\n\n✅ Done:\n- " + "\n- ".join(results), view=None)
-            return
-
-        # confirm mode
-        view = ConfirmView(guild.id, request_id, member.id)
-        await respond_fn(pretty[:1900], view=view)
-
+        synced = await bot.tree.sync()
+        print(f"Synced {len(synced)} commands")
     except Exception as e:
-        await respond_fn(f"⚠️ AI-admin error: {e}", view=None)
+        print("Sync failed:", e)
+    print(f"Logged in as {bot.user} (id={bot.user.id})")
 
+    # Ensure channels exist in all guilds
+    for g in bot.guilds:
+        await ensure_core_channels(g)
 
-# =========================
-# SLASH COMMANDS
-# =========================
-@bot.tree.command(name="ai", description="Ask Nexora AI")
-@app_commands.describe(question="Your question")
-async def ai_cmd(interaction: discord.Interaction, question: str):
-    if not interaction.guild or not isinstance(interaction.user, discord.Member):
-        await interaction.response.send_message("❌ Только на сервере.", ephemeral=True)
-        return
-    guild = interaction.guild
-    member = interaction.user
-
-    premium_tiers = parse_json(get_setting(guild.id, "premium_tiers"), {})
-    admin_role_name = get_setting(guild.id, "admin_role_name")
-
-    model = get_setting(guild.id, "model_free")
-    system = PUBLIC_SYSTEM
-
-    if is_admin(member, admin_role_name):
-        model = get_setting(guild.id, "model_pro")
-        system = PREMIUM_SYSTEM
-        limit = None
-    else:
-        tier = None
-        for r in member.roles:
-            if r.name in premium_tiers:
-                tier = premium_tiers[r.name]
-                break
-        if tier:
-            model = tier.get("model") or get_setting(guild.id, "model_pro")
-            system = PREMIUM_SYSTEM
-            limit = tier.get("daily_limit", None)
-        else:
-            limit = int(get_setting(guild.id, "free_daily_limit"))
-
-    if limit is not None:
-        used = usage_get(guild.id, member.id)
-        if used >= int(limit):
-            await interaction.response.send_message("🚫 Лимит на сегодня исчерпан. Подними подписку/роль.", ephemeral=True)
-            return
-        usage_inc(guild.id, member.id, 1)
-        remaining = int(limit) - (used + 1)
-    else:
-        remaining = None
-
-    server_map = build_server_map(guild)
-    lang_hint = detect_lang_hint(question)
-
-    try:
-        reply = ai_text(model, system + f"\nLanguage hint: {lang_hint}\n\nServer map:\n{server_map}\n", question)
-        if remaining is not None and get_setting(guild.id, "show_remaining") == "1":
-            reply += f"\n\n🧠 Осталось бесплатных сообщений: {remaining}/{limit}"
-        await interaction.response.send_message(reply[:1900], ephemeral=False)
-    except Exception:
-        await interaction.response.send_message("⚠️ AI временно недоступен.", ephemeral=True)
-
-
-@bot.tree.command(name="ai-admin-mode", description="Admin: set ai-admin mode (preview/confirm/execute/lock)")
-@app_commands.describe(mode="preview | confirm | execute | lock")
-async def ai_admin_mode(interaction: discord.Interaction, mode: str):
-    if not interaction.guild or not isinstance(interaction.user, discord.Member):
-        await interaction.response.send_message("❌ Только на сервере.", ephemeral=True)
-        return
-    guild = interaction.guild
-    member = interaction.user
-
-    if not is_admin(member, get_setting(guild.id, "admin_role_name")):
-        await interaction.response.send_message("❌ Нет доступа.", ephemeral=True)
-        return
-
-    mode = mode.lower().strip()
-    if mode not in ("preview", "confirm", "execute", "lock"):
-        await interaction.response.send_message("❌ Используй: preview/confirm/execute/lock", ephemeral=True)
-        return
-
-    set_setting(guild.id, "admin_mode", mode)
-    await audit_log(guild, f"⚙️ admin_mode set to {mode} by <@{member.id}>")
-    await interaction.response.send_message(f"✅ admin_mode = {mode}", ephemeral=True)
-
-
-@bot.tree.command(name="ai-config", description="Admin: set config key/value")
-@app_commands.describe(key="setting key", value="setting value")
-async def ai_config(interaction: discord.Interaction, key: str, value: str):
-    if not interaction.guild or not isinstance(interaction.user, discord.Member):
-        await interaction.response.send_message("❌ Только на сервере.", ephemeral=True)
-        return
-    guild = interaction.guild
-    member = interaction.user
-
-    if not is_admin(member, get_setting(guild.id, "admin_role_name")):
-        await interaction.response.send_message("❌ Нет доступа.", ephemeral=True)
-        return
-
-    if key not in DEFAULTS:
-        await interaction.response.send_message("❌ Неизвестный ключ настройки.", ephemeral=True)
-        return
-
-    set_setting(guild.id, key, value)
-    await audit_log(guild, f"⚙️ setting {key}={value} by <@{member.id}>")
-    await interaction.response.send_message(f"✅ {key} = {value}", ephemeral=True)
-
-
-@bot.tree.command(name="ai-enable-action", description="Admin: enable/disable an admin action")
-@app_commands.describe(action="action name", enabled="true/false")
-async def ai_enable_action(interaction: discord.Interaction, action: str, enabled: bool):
-    if not interaction.guild or not isinstance(interaction.user, discord.Member):
-        await interaction.response.send_message("❌ Только на сервере.", ephemeral=True)
-        return
-    guild = interaction.guild
-    member = interaction.user
-
-    if not is_admin(member, get_setting(guild.id, "admin_role_name")):
-        await interaction.response.send_message("❌ Нет доступа.", ephemeral=True)
-        return
-
-    action = action.strip()
-    if action not in ALL_ACTIONS:
-        await interaction.response.send_message("❌ Неизвестное действие.", ephemeral=True)
-        return
-
-    set_enabled_action(guild.id, action, enabled)
-    await audit_log(guild, f"⚙️ action {action} enabled={enabled} by <@{member.id}>")
-    await interaction.response.send_message(f"✅ {action} enabled={enabled}", ephemeral=True)
-
-
-# =========================
-# MESSAGE-BASED AI
-# - Free chat in #ai-help
-# - Elsewhere: requires @mention (if enabled)
-# - UPGRADE: In #ai-admin, admins can issue admin tasks via @mention (no /)
-# =========================
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
+    if not message.guild:
+        return
 
+    # Let slash commands work
     await bot.process_commands(message)
 
-    if not message.guild or not isinstance(message.author, discord.Member):
-        return
-    guild = message.guild
     member = message.author
-
-    # ignore slash-like lines to avoid accidental triggers
-    if message.content.strip().startswith("/"):
+    if not isinstance(member, discord.Member):
         return
 
-    ai_help = get_setting(guild.id, "ai_help_channel")
-    ai_admin = get_setting(guild.id, "ai_admin_channel")
-    require_mention = get_setting(guild.id, "require_mention_outside_help") == "1"
+    ch_name = channel_name(message.channel)
+    lang = detect_lang(message.content)
 
-    in_help = isinstance(message.channel, discord.TextChannel) and message.channel.name == ai_help
-    in_admin = isinstance(message.channel, discord.TextChannel) and message.channel.name == ai_admin
-
-    mentioned = bot.user and (bot.user in message.mentions)
-
-    # =========================
-    # ADMIN CHAT MODE (in #ai-admin): @mention triggers admin planner
-    # =========================
-    if in_admin and isinstance(message.channel, discord.TextChannel):
-        # must be allowed admin
-        if not is_ai_admin_allowed(guild, member):
+    # Admin channel logic: require mention + admin permission
+    if ch_name == AI_ADMIN_CHANNEL_NAME:
+        if not bot_is_mentioned(message):
+            return
+        if not is_admin_member(member):
+            await message.reply(t(lang,
+                                 "Нет доступа: только AI Admin/Администратор.",
+                                 "Access denied: AI Admin/Administrator only.",
+                                 "Нема доступу: лише AI Admin/Адміністратор."))
             return
 
-        # Require @mention (per your request) OR allow "ai:" prefix (optional)
-        if not mentioned and not message.content.lower().strip().startswith("ai:"):
+        # remove bot mention from text
+        content = re.sub(rf"<@!?{bot.user.id}>", "", message.content).strip()
+        if not content:
+            await message.reply(t(lang, "Напиши задачу после упоминания.", "Write a task after mentioning me.", "Напиши задачу після згадки."))
             return
 
-        task = message.content
-        if mentioned:
-            task = strip_bot_mention(task)
-        if task.lower().strip().startswith("ai:"):
-            task = task.split(":", 1)[1].strip()
+        plan_id = os.urandom(4).hex()
+        # Build plan
+        plan = await build_admin_plan(content)
 
-        if not task:
+        # Always audit the plan
+        await audit_log(message.guild, fmt_plan_header(member, plan_id, plan.get("summary",""), plan.get("risk","low")))
+
+        # Preview-only mode
+        if ADMIN_MODE == "preview":
+            txt = f"🧩 **PLAN {plan_id}**\nSummary: {plan.get('summary')}\nRisk: {plan.get('risk')}\nActions:\n"
+            if plan["actions"]:
+                for a in plan["actions"]:
+                    txt += f"• `{a['name']}` {a['arguments']}\n"
+            else:
+                txt += "• (no actions)\n"
+            if plan.get("notes"):
+                txt += f"Notes: {plan['notes']}"
+            await message.reply(txt)
             return
 
-        async def responder(text: str, view=None):
-            await message.channel.send(text[:1900], view=view)
+        # confirm/lock mode -> show buttons
+        txt = f"🧩 **PLAN {plan_id}**\nSummary: {plan.get('summary')}\nRisk: {plan.get('risk')}\nActions:\n"
+        if plan["actions"]:
+            for a in plan["actions"]:
+                txt += f"• `{a['name']}` {a['arguments']}\n"
+        else:
+            txt += "• (no actions)\n"
+        if plan.get("notes"):
+            txt += f"\nNotes: {plan['notes']}"
 
-        await run_admin_planner(guild, member, message.channel, task, responder)
+        view = PlanView(actor_id=member.id, plan=plan)
+        await message.reply(txt, view=view)
         return
 
-    # =========================
-    # PUBLIC/PREMIUM CHAT MODE
-    # =========================
-    if not in_help:
-        if require_mention and not mentioned:
+    # Non-admin channels: AI chat
+    free_chat = ch_name in AI_FREE_CHAT_CHANNELS
+
+    if REQUIRE_MENTION_OUTSIDE_FREE and (not free_chat):
+        # only respond if mentioned or /ai used
+        if not bot_is_mentioned(message) and not message.content.strip().lower().startswith("/ai"):
             return
 
-    text = message.content
-    if mentioned:
-        text = strip_bot_mention(text)
-    if not text.strip():
+    # check usage limit
+    if is_free_limited(member):
+        day = today_key()
+        used = await db_get_usage(member.id, day)
+        if used >= FREE_DAILY_LIMIT:
+            await message.reply(t(lang,
+                                 f"Лимит на сегодня исчерпан ({FREE_DAILY_LIMIT}/{FREE_DAILY_LIMIT}).",
+                                 f"Daily limit reached ({FREE_DAILY_LIMIT}/{FREE_DAILY_LIMIT}).",
+                                 f"Ліміт на сьогодні вичерпано ({FREE_DAILY_LIMIT}/{FREE_DAILY_LIMIT})."))
+            return
+
+    # Strip /ai and mention
+    user_text = message.content
+    user_text = re.sub(rf"<@!?{bot.user.id}>", "", user_text).strip()
+    if user_text.lower().startswith("/ai"):
+        user_text = user_text[3:].strip()
+
+    if not user_text:
         return
 
-    # tier
-    admin_role_name = get_setting(guild.id, "admin_role_name")
-    premium_tiers = parse_json(get_setting(guild.id, "premium_tiers"), {})
-    model_free = get_setting(guild.id, "model_free")
-    model_pro = get_setting(guild.id, "model_pro")
-
-    is_admin_user = is_admin(member, admin_role_name)
-    tier = None
-    for r in member.roles:
-        if r.name in premium_tiers:
-            tier = premium_tiers[r.name]
-            break
-
-    if is_admin_user:
-        model = model_pro
-        system = PREMIUM_SYSTEM
-        limit = None
-    elif tier:
-        model = tier.get("model") or model_pro
-        system = PREMIUM_SYSTEM
-        limit = tier.get("daily_limit", None)
-    else:
-        model = model_free
-        system = PUBLIC_SYSTEM
-        limit = int(get_setting(guild.id, "free_daily_limit"))
-
-    remaining = None
-    if limit is not None:
-        used = usage_get(guild.id, member.id)
-        if used >= int(limit):
-            await message.channel.send("🚫 Лимит AI на сегодня исчерпан. Подними уровень роли/подписки.")
-            return
-        usage_inc(guild.id, member.id, 1)
-        remaining = int(limit) - (used + 1)
-
-    server_map = build_server_map(guild)
-    lang_hint = detect_lang_hint(text)
-
+    # respond
     try:
-        reply = ai_text(model, system + f"\nLanguage hint: {lang_hint}\n\nServer map:\n{server_map}\n", text)
-        if remaining is not None and get_setting(guild.id, "show_remaining") == "1":
-            reply += f"\n\n🧠 Осталось бесплатных сообщений: {remaining}/{limit}"
-        await message.channel.send(reply[:1900])
-    except Exception:
-        await message.channel.send("⚠️ AI временно недоступен.")
-
-
-@bot.event
-async def on_ready():
-    init_db()
-    try:
-        synced = await bot.tree.sync()
-        print(f"✅ Synced {len(synced)} commands")
+        answer = await ai_chat_response(user_text, lang)
     except Exception as e:
-        print("⚠️ Sync error:", e)
-    print(f"✅ Nexora AI online as {bot.user}")
+        await message.reply(t(lang,
+                             f"Ошибка AI: {type(e).__name__}",
+                             f"AI error: {type(e).__name__}",
+                             f"Помилка AI: {type(e).__name__}"))
+        return
 
+    # inc usage after successful answer
+    if is_free_limited(member):
+        day = today_key()
+        new_used = await db_inc_usage(member.id, day, 1)
+        remaining = max(0, FREE_DAILY_LIMIT - new_used)
+        if SHOW_REMAINING:
+            suffix = t(lang,
+                       f"\n\n🧠 Осталось бесплатных сообщений: {remaining}/{FREE_DAILY_LIMIT}",
+                       f"\n\n🧠 Free messages left: {remaining}/{FREE_DAILY_LIMIT}",
+                       f"\n\n🧠 Залишилось безкоштовних повідомлень: {remaining}/{FREE_DAILY_LIMIT}")
+            answer += suffix
 
+    await message.reply(answer)
+
+# =========================
+# Slash command: /ai
+# =========================
+@bot.tree.command(name="ai", description="Ask Nexora AI (works in any channel).")
+@app_commands.describe(prompt="Your message to Nexora AI")
+async def ai_slash(interaction: discord.Interaction, prompt: str):
+    await interaction.response.defer(thinking=True, ephemeral=False)
+    lang = detect_lang(prompt)
+
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        await interaction.followup.send("Guild-only command.")
+        return
+
+    member: discord.Member = interaction.user
+
+    # limit check
+    if is_free_limited(member):
+        day = today_key()
+        used = await db_get_usage(member.id, day)
+        if used >= FREE_DAILY_LIMIT:
+            await interaction.followup.send(t(lang,
+                                             f"Лимит на сегодня исчерпан ({FREE_DAILY_LIMIT}/{FREE_DAILY_LIMIT}).",
+                                             f"Daily limit reached ({FREE_DAILY_LIMIT}/{FREE_DAILY_LIMIT}).",
+                                             f"Ліміт на сьогодні вичерпано ({FREE_DAILY_LIMIT}/{FREE_DAILY_LIMIT})."))
+            return
+
+    try:
+        answer = await ai_chat_response(prompt, lang)
+    except Exception as e:
+        await interaction.followup.send(t(lang,
+                                         f"Ошибка AI: {type(e).__name__}",
+                                         f"AI error: {type(e).__name__}",
+                                         f"Помилка AI: {type(e).__name__}"))
+        return
+
+    if is_free_limited(member):
+        day = today_key()
+        new_used = await db_inc_usage(member.id, day, 1)
+        remaining = max(0, FREE_DAILY_LIMIT - new_used)
+        if SHOW_REMAINING:
+            answer += t(lang,
+                        f"\n\n🧠 Осталось бесплатных сообщений: {remaining}/{FREE_DAILY_LIMIT}",
+                        f"\n\n🧠 Free messages left: {remaining}/{FREE_DAILY_LIMIT}",
+                        f"\n\n🧠 Залишилось безкоштовних повідомлень: {remaining}/{FREE_DAILY_LIMIT}")
+
+    await interaction.followup.send(answer)
+
+# =========================
+# Run
+# =========================
 bot.run(DISCORD_TOKEN)
