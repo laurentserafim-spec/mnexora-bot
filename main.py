@@ -1,13 +1,11 @@
 import os
 import json
 import re
-import asyncio
 import sqlite3
 from datetime import datetime, timezone, date
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import discord
-from discord import app_commands
 from discord.ext import commands
 
 from openai import OpenAI
@@ -19,34 +17,27 @@ from openai import OpenAI
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
-# Channel names (you can change if needed)
 AI_ADMIN_CHANNEL_NAME = os.getenv("AI_ADMIN_CHANNEL_NAME", "ai-admin").strip()
 AI_AUDIT_CHANNEL_NAME = os.getenv("AI_AUDIT_CHANNEL_NAME", "ai-audit-log").strip()
 
-# Roles (names)
 ROLE_ADMINISTRATOR = os.getenv("ROLE_ADMINISTRATOR", "Administrator").strip()
 ROLE_AI_ADMIN = os.getenv("ROLE_AI_ADMIN", "AI Admin").strip()
-ROLE_BOT_ROLE = os.getenv("ROLE_BOT_ROLE", "Nexora AI").strip()
 
 ROLE_VISITOR = os.getenv("ROLE_VISITOR", "Visitor").strip()
 ROLE_MEMBER = os.getenv("ROLE_MEMBER", "Member").strip()
 
-# Daily limits
 VISITOR_DAILY_LIMIT = int(os.getenv("VISITOR_DAILY_LIMIT", "15"))
 MEMBER_DAILY_LIMIT = int(os.getenv("MEMBER_DAILY_LIMIT", "50"))
 
-# Behavior
-ALWAYS_ENGLISH = os.getenv("ALWAYS_ENGLISH", "1").strip() == "1"  # 1 => only English replies
+ALWAYS_ENGLISH = os.getenv("ALWAYS_ENGLISH", "1").strip() == "1"
 MODEL_ADMIN = os.getenv("MODEL_ADMIN", "gpt-4.1-mini").strip()
 
-# SQLite file
 DB_PATH = os.getenv("DB_PATH", "nexora.sqlite3").strip()
 
 if not DISCORD_TOKEN:
     raise RuntimeError("DISCORD_TOKEN is missing")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is missing")
-
 
 client_ai = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -91,7 +82,6 @@ def db_init() -> None:
 
 
 def get_today_key() -> str:
-    # Use UTC day for stable daily limits
     return date.today().isoformat()
 
 
@@ -144,7 +134,6 @@ def audit_write(guild_id: Optional[int], actor: discord.abc.User, action_type: s
 # DISCORD HELPERS
 # =========================
 def is_admin_member(member: discord.Member) -> bool:
-    # If they have Discord Administrator permission OR roles Admin/AI Admin
     if member.guild_permissions.administrator:
         return True
     role_names = {r.name for r in member.roles}
@@ -152,13 +141,12 @@ def is_admin_member(member: discord.Member) -> bool:
 
 
 def get_daily_limit_for(member: discord.Member) -> Optional[int]:
-    # None => unlimited
     if is_admin_member(member):
         return None
     role_names = {r.name for r in member.roles}
     if ROLE_MEMBER in role_names:
         return MEMBER_DAILY_LIMIT
-    return VISITOR_DAILY_LIMIT  # default visitor
+    return VISITOR_DAILY_LIMIT
 
 
 def find_text_channel_by_name(guild: discord.Guild, name: str) -> Optional[discord.TextChannel]:
@@ -177,17 +165,21 @@ def find_role_by_name(guild: discord.Guild, name: str) -> Optional[discord.Role]
     return None
 
 
-def normalize_channel_ref(value: str) -> str:
-    # Accept "#general", "general", channel id
-    v = str(value).strip()
-    return v
-
-
 def parse_int(value: Any) -> Optional[int]:
     try:
         return int(str(value).strip())
     except Exception:
         return None
+
+
+async def resolve_channel(guild: discord.Guild, channel_ref: str) -> Optional[discord.TextChannel]:
+    channel_ref = str(channel_ref).strip()
+    cid = parse_int(channel_ref)
+    if cid:
+        ch = guild.get_channel(cid)
+        if isinstance(ch, discord.TextChannel):
+            return ch
+    return find_text_channel_by_name(guild, channel_ref)
 
 
 # =========================
@@ -206,137 +198,116 @@ Rules:
 - Do NOT invent channel/role/user IDs. Use provided names/ids; if ambiguous, choose the safest option (no action) and ask for clarification.
 - Prefer minimal changes. Do not modify Administrator permissions.
 - Always output tool calls (if any) for concrete actions. If nothing actionable, output a short message explaining what is missing.
-
-Output style:
-- Provide short summary and risk level (low/medium/high) inside the message response.
-- Then perform tool calls as needed.
 """.strip()
 
 
 def tool_schema() -> List[Dict[str, Any]]:
-    # IMPORTANT: new Responses API tool format requires: {"type":"function","function": {"name":..., "description":..., "parameters":...}}
+    # ✅ IMPORTANT FIX:
+    # API expects tools[i].name at TOP LEVEL (not nested under "function")
     return [
         {
             "type": "function",
-            "function": {
-                "name": "create_text_channel",
-                "description": "Create a new text channel in the guild.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string", "description": "Channel name, without #"},
-                        "category": {"type": ["string", "null"], "description": "Optional category name"},
-                    },
-                    "required": ["name"],
+            "name": "create_text_channel",
+            "description": "Create a new text channel in the guild.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Channel name, without #"},
+                    "category": {"type": ["string", "null"], "description": "Optional category name"},
                 },
+                "required": ["name"],
             },
         },
         {
             "type": "function",
-            "function": {
-                "name": "send_message",
-                "description": "Send a message to a channel.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "channel": {"type": "string", "description": "Channel name (#name) or channel id"},
-                        "content": {"type": "string", "description": "Message content"},
-                        "pin": {"type": "boolean", "description": "Whether to pin the sent message"},
-                    },
-                    "required": ["channel", "content"],
+            "name": "send_message",
+            "description": "Send a message to a channel.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "channel": {"type": "string", "description": "Channel name (#name) or channel id"},
+                    "content": {"type": "string", "description": "Message content"},
+                    "pin": {"type": "boolean", "description": "Whether to pin the sent message"},
                 },
+                "required": ["channel", "content"],
             },
         },
         {
             "type": "function",
-            "function": {
-                "name": "pin_message",
-                "description": "Pin a message by id in a channel.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "channel": {"type": "string", "description": "Channel name (#name) or channel id"},
-                        "message_id": {"type": "string", "description": "Message id"},
-                    },
-                    "required": ["channel", "message_id"],
+            "name": "pin_message",
+            "description": "Pin a message by id in a channel.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "channel": {"type": "string", "description": "Channel name (#name) or channel id"},
+                    "message_id": {"type": "string", "description": "Message id"},
                 },
+                "required": ["channel", "message_id"],
             },
         },
         {
             "type": "function",
-            "function": {
-                "name": "delete_message",
-                "description": "Delete a message by id in a channel (requires Manage Messages and proper permissions).",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "channel": {"type": "string", "description": "Channel name (#name) or channel id"},
-                        "message_id": {"type": "string", "description": "Message id"},
-                        "reason": {"type": ["string", "null"], "description": "Optional reason"},
-                    },
-                    "required": ["channel", "message_id"],
+            "name": "delete_message",
+            "description": "Delete a message by id in a channel (requires Manage Messages and proper permissions).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "channel": {"type": "string", "description": "Channel name (#name) or channel id"},
+                    "message_id": {"type": "string", "description": "Message id"},
+                    "reason": {"type": ["string", "null"], "description": "Optional reason"},
                 },
+                "required": ["channel", "message_id"],
             },
         },
         {
             "type": "function",
-            "function": {
-                "name": "create_role",
-                "description": "Create a new role in the guild.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string", "description": "Role name"},
-                    },
-                    "required": ["name"],
-                },
+            "name": "create_role",
+            "description": "Create a new role in the guild.",
+            "parameters": {
+                "type": "object",
+                "properties": {"name": {"type": "string", "description": "Role name"}},
+                "required": ["name"],
             },
         },
         {
             "type": "function",
-            "function": {
-                "name": "add_role_to_user",
-                "description": "Add a role to a user by user id.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "user": {"type": "string", "description": "User id"},
-                        "role": {"type": "string", "description": "Role name"},
-                    },
-                    "required": ["user", "role"],
+            "name": "add_role_to_user",
+            "description": "Add a role to a user by user id.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user": {"type": "string", "description": "User id"},
+                    "role": {"type": "string", "description": "Role name"},
                 },
+                "required": ["user", "role"],
             },
         },
         {
             "type": "function",
-            "function": {
-                "name": "remove_role_from_user",
-                "description": "Remove a role from a user by user id.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "user": {"type": "string", "description": "User id"},
-                        "role": {"type": "string", "description": "Role name"},
-                    },
-                    "required": ["user", "role"],
+            "name": "remove_role_from_user",
+            "description": "Remove a role from a user by user id.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user": {"type": "string", "description": "User id"},
+                    "role": {"type": "string", "description": "Role name"},
                 },
+                "required": ["user", "role"],
             },
         },
         {
             "type": "function",
-            "function": {
-                "name": "set_channel_permissions",
-                "description": "Set channel permissions for a role (view/send).",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "channel": {"type": "string", "description": "Channel name (#name) or channel id"},
-                        "role": {"type": "string", "description": "Role name"},
-                        "view": {"type": ["boolean", "null"], "description": "Allow view channel (None = don't change)"},
-                        "send": {"type": ["boolean", "null"], "description": "Allow send messages (None = don't change)"},
-                    },
-                    "required": ["channel", "role"],
+            "name": "set_channel_permissions",
+            "description": "Set channel permissions for a role (view/send).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "channel": {"type": "string", "description": "Channel name (#name) or channel id"},
+                    "role": {"type": "string", "description": "Role name or '@everyone'"},
+                    "view": {"type": ["boolean", "null"], "description": "Allow view channel (None = don't change)"},
+                    "send": {"type": ["boolean", "null"], "description": "Allow send messages (None = don't change)"},
                 },
+                "required": ["channel", "role"],
             },
         },
     ]
@@ -347,8 +318,8 @@ TOOLS_SCHEMA = tool_schema()
 
 async def build_admin_plan(user_text: str) -> Dict[str, Any]:
     """
-    Builds a plan via OpenAI Responses API.
-    FIXED: tools schema format is correct and includes required function.name.
+    Build a plan via Responses API.
+    Compatible with tool format that requires tools[i].name.
     """
     resp = client_ai.responses.create(
         model=MODEL_ADMIN,
@@ -362,25 +333,24 @@ async def build_admin_plan(user_text: str) -> Dict[str, Any]:
 
     summary = "Admin request"
     risk = "low"
-    notes = ""
     actions: List[Dict[str, Any]] = []
 
-    # Parse output items
-    for item in resp.output:
-        # Message text
-        if getattr(item, "type", None) == "message":
-            for c in item.content:
-                if c.type == "output_text":
-                    # Use as summary if present
-                    txt = (c.text or "").strip()
+    # Robust parsing across SDK variants
+    for item in getattr(resp, "output", []):
+        t = getattr(item, "type", None)
+
+        if t == "message":
+            for c in getattr(item, "content", []):
+                if getattr(c, "type", None) == "output_text":
+                    txt = (getattr(c, "text", "") or "").strip()
                     if txt:
                         summary = txt
 
-        # Tool calls
-        if getattr(item, "type", None) == "tool_call":
-            # item.name = function name in Responses API
-            # item.arguments may be a dict or a JSON string depending on SDK versions
-            args = item.arguments
+        # Some SDKs may name it tool_call or function_call
+        if t in ("tool_call", "function_call"):
+            name = getattr(item, "name", None) or getattr(item, "tool_name", None)
+            args = getattr(item, "arguments", None)
+
             if isinstance(args, str):
                 try:
                     args = json.loads(args)
@@ -388,19 +358,19 @@ async def build_admin_plan(user_text: str) -> Dict[str, Any]:
                     args = {"raw": args}
             if args is None:
                 args = {}
-            actions.append({"name": item.name, "arguments": args})
 
-    # Try to detect risk keywords in summary if model includes them
-    # (optional; safe default "low")
+            if name:
+                actions.append({"name": name, "arguments": args})
+
     m = re.search(r"risk\s*:\s*(low|medium|high)", summary, re.IGNORECASE)
     if m:
         risk = m.group(1).lower()
 
-    return {"summary": summary, "risk": risk, "notes": notes, "actions": actions}
+    return {"summary": summary, "risk": risk, "actions": actions}
 
 
 # =========================
-# EXECUTION: TOOL IMPLEMENTATIONS
+# TOOL IMPLEMENTATIONS
 # =========================
 async def tool_create_text_channel(guild: discord.Guild, args: Dict[str, Any]) -> str:
     name = str(args.get("name", "")).strip().lstrip("#")
@@ -410,30 +380,14 @@ async def tool_create_text_channel(guild: discord.Guild, args: Dict[str, Any]) -
 
     category = None
     if category_name:
-        cn = str(category_name).strip()
+        cn = str(category_name).strip().lower()
         for cat in guild.categories:
-            if cat.name.lower() == cn.lower():
+            if cat.name.lower() == cn:
                 category = cat
                 break
 
-    # Create channel
     ch = await guild.create_text_channel(name=name, category=category, reason="Nexora AI admin action")
     return f"✅ Created text channel: #{ch.name}"
-
-
-async def resolve_channel(guild: discord.Guild, channel_ref: str) -> Optional[discord.TextChannel]:
-    channel_ref = normalize_channel_ref(channel_ref)
-
-    # By ID
-    cid = parse_int(channel_ref)
-    if cid:
-        ch = guild.get_channel(cid)
-        if isinstance(ch, discord.TextChannel):
-            return ch
-
-    # By name
-    ch = find_text_channel_by_name(guild, channel_ref)
-    return ch
 
 
 async def tool_send_message(guild: discord.Guild, args: Dict[str, Any]) -> str:
@@ -511,8 +465,7 @@ async def tool_create_role(guild: discord.Guild, args: Dict[str, Any]) -> str:
     name = str(args.get("name", "")).strip()
     if not name:
         return "❌ Missing role name."
-    existing = find_role_by_name(guild, name)
-    if existing:
+    if find_role_by_name(guild, name):
         return f"✅ Role already exists: {name}"
     await guild.create_role(name=name, reason="Nexora AI admin action")
     return f"✅ Created role: {name}"
@@ -583,7 +536,6 @@ async def tool_set_channel_permissions(guild: discord.Guild, args: Dict[str, Any
     if not ch:
         return f"❌ Channel not found: {ch_ref}"
 
-    role = None
     if role_name.lower() in ["@everyone", "everyone"]:
         role = guild.default_role
     else:
@@ -592,7 +544,6 @@ async def tool_set_channel_permissions(guild: discord.Guild, args: Dict[str, Any
     if not role:
         return f"❌ Role not found: {role_name}"
 
-    # Prepare overwrite
     overwrite = ch.overwrites_for(role)
     if isinstance(view, bool):
         overwrite.view_channel = view
@@ -624,8 +575,8 @@ TOOL_EXECUTORS = {
 # UI: Confirm/Cancel Buttons
 # =========================
 class PlanView(discord.ui.View):
-    def __init__(self, bot: commands.Bot, plan_id: str, actor_id: int):
-        super().__init__(timeout=600)  # 10 minutes
+    def __init__(self, bot: "NexoraBot", plan_id: str, actor_id: int):
+        super().__init__(timeout=600)
         self.bot = bot
         self.plan_id = plan_id
         self.actor_id = actor_id
@@ -636,7 +587,6 @@ class PlanView(discord.ui.View):
             await interaction.response.send_message("❌ Only the admin who created this plan can confirm it.", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True)
-
         result = await self.bot.execute_plan(self.plan_id, interaction)
         await interaction.followup.send(result, ephemeral=True)
         self.stop()
@@ -647,7 +597,6 @@ class PlanView(discord.ui.View):
             await interaction.response.send_message("❌ Only the admin who created this plan can cancel it.", ephemeral=True)
             return
         await interaction.response.send_message("🛑 Cancelled.", ephemeral=True)
-        # Remove stored plan
         self.bot.pending_plans.pop(self.plan_id, None)
         self.stop()
 
@@ -660,17 +609,11 @@ intents.message_content = True
 intents.members = True
 intents.guilds = True
 
+
 class NexoraBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="!", intents=intents)
-        self.pending_plans: Dict[str, Dict[str, Any]] = {}  # plan_id -> plan data
-
-    async def setup_hook(self):
-        # Optional slash command sync
-        try:
-            await self.tree.sync()
-        except Exception:
-            pass
+        self.pending_plans: Dict[str, Dict[str, Any]] = {}
 
     async def on_ready(self):
         print(f"Logged in as {self.user} (id={self.user.id})")
@@ -686,7 +629,6 @@ class NexoraBot(commands.Bot):
         summary: str = plan["summary"]
         risk: str = plan["risk"]
 
-        # Execute tools
         results: List[str] = []
         for a in actions:
             name = a.get("name")
@@ -701,29 +643,29 @@ class NexoraBot(commands.Bot):
             except Exception as e:
                 results.append(f"❌ Failed action {name}: {e}")
 
-        # Audit
-        audit_write(guild.id, actor, "EXECUTE_PLAN", {"plan_id": plan_id, "summary": summary, "risk": risk, "actions": actions, "results": results})
+        audit_write(guild.id, actor, "EXECUTE_PLAN", {
+            "plan_id": plan_id, "summary": summary, "risk": risk,
+            "actions": actions, "results": results
+        })
 
-        # Send to audit channel
         audit_ch = find_text_channel_by_name(guild, AI_AUDIT_CHANNEL_NAME)
         if audit_ch:
-            text = f"✅ **EXECUTED** by {actor.mention} | {summary}\n" + "\n".join([f"• {r}" for r in results]) if results else f"✅ **EXECUTED** by {actor.mention} | {summary}\n-"
+            text = f"✅ **EXECUTED** by {actor.mention} | {summary} | risk={risk}\n" + (
+                "\n".join([f"• {r}" for r in results]) if results else "-"
+            )
             await audit_ch.send(text)
 
-        # Remove plan
         self.pending_plans.pop(plan_id, None)
 
         if results:
             return "✅ Done:\n" + "\n".join([f"- {r}" for r in results])
         return "✅ Done."
 
+
 bot = NexoraBot()
 
-
-# =========================
-# ADMIN COMMAND ENTRY (MENTION)
-# =========================
 MENTION_RE = re.compile(r"^<@!?\d+>\s*(.*)$", re.DOTALL)
+
 
 async def handle_admin_request(message: discord.Message, request_text: str) -> None:
     if not message.guild or not isinstance(message.author, discord.Member):
@@ -732,18 +674,15 @@ async def handle_admin_request(message: discord.Message, request_text: str) -> N
     guild = message.guild
     actor: discord.Member = message.author
 
-    # Only allow from ai-admin channel
     if not isinstance(message.channel, discord.TextChannel):
         return
     if message.channel.name.lower() != AI_ADMIN_CHANNEL_NAME.lower():
         return
 
-    # Must be admin
     if not is_admin_member(actor):
         await message.reply("❌ You do not have permission to use admin mode here.", mention_author=False)
         return
 
-    # Build plan via OpenAI
     try:
         plan = await build_admin_plan(request_text)
     except Exception as e:
@@ -756,44 +695,34 @@ async def handle_admin_request(message: discord.Message, request_text: str) -> N
         "actor": actor,
         "summary": plan.get("summary", "Admin request"),
         "risk": plan.get("risk", "low"),
-        "notes": plan.get("notes", ""),
         "actions": plan.get("actions", []),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    # Audit PLAN
     audit_write(guild.id, actor, "PLAN", {"plan_id": plan_id, "request": request_text, "plan": plan})
 
-    # Send to audit channel too
     audit_ch = find_text_channel_by_name(guild, AI_AUDIT_CHANNEL_NAME)
     if audit_ch:
         await audit_ch.send(f"📝 **ADMIN PLAN** by {actor.mention} | {plan['summary']} | risk={plan.get('risk','low')} | id={plan_id}")
 
-    # Show plan in ai-admin
     actions = plan.get("actions", [])
-    lines = []
-    lines.append(f"🧩 **PLAN {plan_id}**")
-    lines.append(f"**Summary:** {plan.get('summary','')}")
-    lines.append(f"**Risk:** {plan.get('risk','low')}")
+    lines = [
+        f"🧩 **PLAN {plan_id}**",
+        f"**Summary:** {plan.get('summary','')}",
+        f"**Risk:** {plan.get('risk','low')}",
+    ]
     if actions:
         lines.append("**Actions:**")
         for a in actions:
             lines.append(f"• `{a.get('name')}` {a.get('arguments')}")
     else:
         lines.append("**Actions:** (no actions)")
-        if plan.get("notes"):
-            lines.append(f"**Notes:** {plan.get('notes')}")
 
     view = PlanView(bot, plan_id=plan_id, actor_id=actor.id)
     await message.reply("\n".join(lines), view=view, mention_author=False)
 
 
-# =========================
-# NORMAL CHAT MODE (LIMITED)
-# =========================
 async def handle_public_chat(message: discord.Message) -> None:
-    # Optional: If you want the bot to reply in other channels with daily limits.
-    # This keeps it simple: bot replies only when mentioned.
     if not message.guild or not isinstance(message.author, discord.Member):
         return
     if message.author.bot:
@@ -812,8 +741,6 @@ async def handle_public_chat(message: discord.Message) -> None:
     else:
         footer = ""
 
-    # Very simple response (you can later upgrade to full assistant mode)
-    # For now: acknowledge + point to tickets/ai-admin
     if ALWAYS_ENGLISH:
         text = "Hi! For admin actions, please use #ai-admin. For support, open a ticket if available." + footer
     else:
@@ -827,40 +754,24 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    # If bot is mentioned
     if bot.user and bot.user.mentioned_in(message):
         content = message.content.strip()
         m = MENTION_RE.match(content)
-        if m:
-            after = (m.group(1) or "").strip()
-        else:
-            # If mention isn't at start, still accept entire content
-            after = content
+        after = (m.group(1) or "").strip() if m else content
 
-        # If in ai-admin -> admin mode
         if isinstance(message.channel, discord.TextChannel) and message.channel.name.lower() == AI_ADMIN_CHANNEL_NAME.lower():
             if not after:
-                await message.reply("Please write the admin request after mentioning me. Example: @Nexora AI create text channel test3", mention_author=False)
+                await message.reply("Please write the admin request after mentioning me.", mention_author=False)
                 return
             await handle_admin_request(message, after)
             return
 
-        # Else: normal limited mode
         await handle_public_chat(message)
         return
 
     await bot.process_commands(message)
 
 
-# Optional slash command: /ping
-@bot.tree.command(name="ping", description="Check if the bot is alive")
-async def ping(interaction: discord.Interaction):
-    await interaction.response.send_message("✅ Pong!", ephemeral=True)
-
-
-# =========================
-# STARTUP
-# =========================
 def main():
     db_init()
     bot.run(DISCORD_TOKEN)
