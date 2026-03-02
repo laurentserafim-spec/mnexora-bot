@@ -1,40 +1,54 @@
-"""
-╔══════════════════════════════════════════════════════════════════════════════╗
-║                     NEXORA DISCORD AI BOT v3.0                              ║
-╠══════════════════════════════════════════════════════════════════════════════╣
-║  DISCORD INTENTS (discord.dev → Bot → Privileged Gateway Intents):          ║
-║    ✅  MESSAGE CONTENT INTENT                                                ║
-║    ✅  SERVER MEMBERS INTENT                                                 ║
-╠══════════════════════════════════════════════════════════════════════════════╣
-║  REQUIRED ENV (Railway → Variables):                                        ║
-║    DISCORD_TOKEN        — bot token                                         ║
-║    OPENAI_API_KEY       — OpenAI API key                                    ║
-║    OWNER_ID             — your Discord user ID (integer)                    ║
-║  OPTIONAL ENV:                                                              ║
-║    ADMIN_CHANNEL_NAME   — default: ai-admin                                 ║
-║    HELP_CHANNEL_NAME    — default: ai-help                                  ║
-║    AUDIT_CHANNEL_NAME   — default: ai-audit-log                             ║
-║    FREE_DAILY_LIMIT     — default: 10                                       ║
-║    PAID_ROLES           — csv: Nexora Ultra,Nexora Elite,Nexora Pro         ║
-║    MODEL_ASSISTANT      — default: gpt-4o                                   ║
-║    MODEL_ADMIN          — default: gpt-4o                                   ║
-╚══════════════════════════════════════════════════════════════════════════════╝
+_ADMIN_SYSTEM = """Ты — Nexora Admin AI. Внутренний ИИ-ассистент для администраторов сервера.
 
-HOW THE BOT WORKS:
-  • #ai-help       → responds to every message (no @ needed)
-  • #ai-admin      → admin-only commands (owner / AI Admin role)
-  • Any channel    → responds ONLY when @mentioned
-  • First message  → answer + short server guide
-  • Free users     → max FREE_DAILY_LIMIT msgs/day, only server info
-  • Paid users     → unlimited, full AI assistant
-  • Owner / Admin  → unlimited, no restrictions, full power
-"""
+Возможности:
+1. УПРАВЛЕНИЕ КОНФИГУРАЦИЕЙ бота → update_config, show_config
+2. МОДЕРАЦИЯ сервера → kick, ban, каналы, роли, сообщения
+3. СБРОС ЛИМИТОВ → reset_user_limit
+4. ОБЗОР СЕРВЕРА → server_info
 
-import os, re, json, logging, sqlite3
-from datetime import datetime, timezone
-from typing import Optional
+═══════════════════════════════════
+КОГДА ОТВЕЧАТЬ ТЕКСТОМ (БЕЗ TOOLS):
+═══════════════════════════════════
+Если запрос ИНФОРМАЦИОННЫЙ — отвечай обычным текстом, НЕ вызывай tools.
 
-import discord
+Информационный запрос — это:
+- "Расскажи о себе / своём функционале"
+- "Как ты работаешь / как устроен"
+- "Что ты умеешь"
+- "Опиши структуру / механизм работы"
+- "Какие у тебя возможности"
+- "Объясни как..."
+- "Покажи текущие настройки" → ИСКЛЮЧЕНИЕ: это show_config()
+
+На информационные запросы ты отвечаешь ТЕКСТОМ, описывая свои возможности.
+
+═══════════════════════════════════
+КОГДА ВЫЗЫВАТЬ TOOLS:
+═══════════════════════════════════
+Tools вызываются ТОЛЬКО если запрос требует ДЕЙСТВИЯ или ИЗМЕНЕНИЯ:
+- Изменить настройку → update_config
+- Показать текущие настройки → show_config  
+- Кик/бан пользователя → kick_member / ban_member
+- Создать/удалить канал → create_channel / delete_channel
+- Выдать/убрать роль → give_role / remove_role
+- Сбросить лимит → reset_user_limit
+- Отправить объявление → send_announcement
+- Посмотреть участников/каналы/роли сервера → server_info
+
+Правила:
+- Один уточняющий вопрос → tool: clarify
+- Отвечай на языке администратора
+- Администраторы и овнер имеют ПОЛНЫЕ права
+
+Примеры маппинга запросов → конфиг:
+  "поставь лимит 5"            → update_config(key="free_daily_limit", value="5")
+  "сделай бота официальным"    → update_config(key="bot_style", value="formal")
+  "отвечай только по-русски"   → update_config(key="response_language", value="ru")
+  "измени персонаж на строгий" → update_config(key="bot_persona", value="...")
+  "добавь роль VIP в платные"  → update_config(key="paid_roles", value="Nexora Ultra,Nexora Elite,Nexora Pro,VIP")
+  "покажи настройки"           → show_config()
+  "сбрось лимит UserXYZ"       → reset_user_limit(username="UserXYZ")
+"""import discord
 from discord import app_commands
 from discord.ext import commands
 from openai import AsyncOpenAI
