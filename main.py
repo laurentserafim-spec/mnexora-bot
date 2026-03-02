@@ -1,1429 +1,1101 @@
+"""
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                        NEXORA DISCORD AI BOT                                ║
+║                              main.py                                         ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  DISCORD DEVELOPER PORTAL — INTENTS (Settings → Bot → Privileged Intents): ║
+║    ✅  MESSAGE CONTENT INTENT  (Privileged)                                 ║
+║    ✅  SERVER MEMBERS INTENT   (Privileged)                                 ║
+║    ✅  GUILD MESSAGES          (default)                                    ║
+║    ✅  GUILDS                  (default)                                    ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  RAILWAY ENV VARIABLES:                                                     ║
+║    DISCORD_TOKEN        — bot token from discord.dev                        ║
+║    OPENAI_API_KEY       — OpenAI key                                        ║
+║    OWNER_ID             — your Discord user ID (integer as string)          ║
+║    ADMIN_CHANNEL_NAME   — default: ai-admin                                 ║
+║    HELP_CHANNEL_NAME    — default: ai-help                                  ║
+║    AUDIT_CHANNEL_NAME   — default: ai-audit-log                             ║
+║    FREE_DAILY_LIMIT     — default: 10                                       ║
+║    PAID_ROLES           — csv, default: Nexora Ultra,Nexora Elite,Nexora Pro║
+║    MODEL_ASSISTANT      — default: gpt-4o                                   ║
+║    MODEL_ADMIN          — default: gpt-4o                                   ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+"""
+
+# ─── IMPORTS ──────────────────────────────────────────────────────────────────
 import os
 import re
 import json
-import time
+import logging
 import sqlite3
-import datetime as dt
-from typing import Any, Dict, List, Optional, Tuple
+import asyncio
+from datetime import datetime, timezone
+from typing import Optional
 
 import discord
 from discord import app_commands
 from discord.ext import commands
+from openai import AsyncOpenAI
 
-# OpenAI (python package: openai>=1.0.0)
-from openai import OpenAI
+# ─── LOGGING ──────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+log = logging.getLogger("nexora")
 
-# =========================
-# CONFIG (ENV)
-# =========================
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+# ─── CONFIG FROM ENV ──────────────────────────────────────────────────────────
+DISCORD_TOKEN      = os.environ["DISCORD_TOKEN"]
+OPENAI_API_KEY     = os.environ["OPENAI_API_KEY"]
+OWNER_ID           = int(os.environ.get("OWNER_ID", "0"))
 
-# You can configure by name OR by ID (recommended).
-GUILD_ID = int(os.getenv("GUILD_ID", "0") or "0")
+ADMIN_CHANNEL_NAME = os.environ.get("ADMIN_CHANNEL_NAME", "ai-admin")
+HELP_CHANNEL_NAME  = os.environ.get("HELP_CHANNEL_NAME",  "ai-help")
+AUDIT_CHANNEL_NAME = os.environ.get("AUDIT_CHANNEL_NAME", "ai-audit-log")
+FREE_DAILY_LIMIT   = int(os.environ.get("FREE_DAILY_LIMIT", "10"))
 
-AI_ADMIN_CHANNEL_NAME = os.getenv("AI_ADMIN_CHANNEL_NAME", "ai-admin").strip()   # hidden channel
-AI_AUDIT_CHANNEL_NAME = os.getenv("AI_AUDIT_CHANNEL_NAME", "ai-audit-log").strip()
+PAID_ROLES: list[str] = [
+    r.strip() for r in
+    os.environ.get("PAID_ROLES", "Nexora Ultra,Nexora Elite,Nexora Pro").split(",")
+    if r.strip()
+]
 
-# Public support/help channels where bot answers users
-PUBLIC_AI_CHANNELS = [c.strip() for c in os.getenv("PUBLIC_AI_CHANNELS", "ai-help,ai-support,ai-guide").split(",") if c.strip()]
+MODEL_ASSISTANT = os.environ.get("MODEL_ASSISTANT", "gpt-4o")
+MODEL_ADMIN     = os.environ.get("MODEL_ADMIN",     "gpt-4o")
+DB_PATH         = "nexora.sqlite3"
 
-# Roles
-ROLE_AI_ADMIN = os.getenv("ROLE_AI_ADMIN", "AI Admin").strip()
-ROLE_ADMINISTRATOR = os.getenv("ROLE_ADMINISTRATOR", "Administrator").strip()
-
-PAID_ROLES = [r.strip() for r in os.getenv("PAID_ROLES", "Nexora Pro,Nexora Elite,Nexora Ultra").split(",") if r.strip()]
-
-# Limits
-FREE_DAILY_LIMIT = int(os.getenv("FREE_DAILY_LIMIT", "10") or "10")
-
-# Models
-MODEL_ASSIST = os.getenv("MODEL_ASSIST", "gpt-4.1-mini")
-MODEL_ADMIN = os.getenv("MODEL_ADMIN", "gpt-4.1-mini")
-MODEL_MODERATION = os.getenv("MODEL_MODERATION", "gpt-4.1-mini")
-
-# Misc
-DB_PATH = os.getenv("DB_PATH", "nexora.db")
-
-# =========================
-# SAFETY: NEVER MENTION AI-ADMIN TO USERS
-# =========================
-USER_FACING_ADMIN_REDIRECT = (
-    "Для админ-действий напиши администрации сервера. "
-    "Я здесь как помощник по использованию Nexora и его функций."
+# Names that must NEVER appear in public output
+_HIDDEN_NAMES   = {ADMIN_CHANNEL_NAME, AUDIT_CHANNEL_NAME, "audit-log", "ai-audit-log"}
+_HIDDEN_PATTERN = re.compile(
+    r"#?\b(ai[-_]?admin|ai[-_]?audit[-_]?log|audit[-_]?log"
+    r"|admin\s*channel|internal\s*admin|admin\s*process)\b",
+    re.IGNORECASE,
 )
 
-WELCOME_BLURB = (
-    "Я Nexora AI — дружелюбный помощник по серверу Nexora.\n"
-    "Могу подсказать, как пользоваться функциями сервера, торговыми каналами, тикетами и правилами.\n"
-    "Напиши вопрос прямо сюда и укажи, что именно хочешь сделать."
-)
+# ─── OPENAI CLIENT ────────────────────────────────────────────────────────────
+ai = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-# =========================
-# DATABASE
-# =========================
-def db_connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("PRAGMA journal_mode=WAL;")
+# ─── DISCORD BOT ─────────────────────────────────────────────────────────────
+intents = discord.Intents.default()
+intents.message_content = True   # Privileged — enable in dev portal
+intents.members         = True   # Privileged — enable in dev portal
+
+bot  = commands.Bot(command_prefix="!", intents=intents)
+tree = bot.tree
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DATABASE
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
     return conn
 
-def db_init():
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS usage_daily (
-        user_id INTEGER NOT NULL,
-        day TEXT NOT NULL,
-        count INTEGER NOT NULL,
-        PRIMARY KEY (user_id, day)
-    )
-    """)
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS user_state (
-        user_id INTEGER PRIMARY KEY,
-        greeted INTEGER NOT NULL DEFAULT 0
-    )
-    """)
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS pending_plans (
-        plan_id TEXT PRIMARY KEY,
-        created_at INTEGER NOT NULL,
-        requester_id INTEGER NOT NULL,
-        channel_id INTEGER NOT NULL,
-        plan_json TEXT NOT NULL
-    )
-    """)
-    conn.commit()
-    conn.close()
-
-def today_key_utc() -> str:
-    return dt.datetime.utcnow().strftime("%Y-%m-%d")
-
-def usage_get(user_id: int) -> int:
-    conn = db_connect()
-    cur = conn.cursor()
-    day = today_key_utc()
-    cur.execute("SELECT count FROM usage_daily WHERE user_id=? AND day=?", (user_id, day))
-    row = cur.fetchone()
-    conn.close()
-    return int(row[0]) if row else 0
-
-def usage_inc(user_id: int) -> int:
-    conn = db_connect()
-    cur = conn.cursor()
-    day = today_key_utc()
-    cur.execute("SELECT count FROM usage_daily WHERE user_id=? AND day=?", (user_id, day))
-    row = cur.fetchone()
-    if row:
-        new_count = int(row[0]) + 1
-        cur.execute("UPDATE usage_daily SET count=? WHERE user_id=? AND day=?", (new_count, user_id, day))
-    else:
-        new_count = 1
-        cur.execute("INSERT INTO usage_daily(user_id, day, count) VALUES(?,?,?)", (user_id, day, new_count))
-    conn.commit()
-    conn.close()
-    return new_count
-
-def greeted_get(user_id: int) -> bool:
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("SELECT greeted FROM user_state WHERE user_id=?", (user_id,))
-    row = cur.fetchone()
-    conn.close()
-    return bool(row and int(row[0]) == 1)
-
-def greeted_set(user_id: int):
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("INSERT INTO user_state(user_id, greeted) VALUES(?,1) ON CONFLICT(user_id) DO UPDATE SET greeted=1", (user_id,))
-    conn.commit()
-    conn.close()
-
-def pending_save(plan_id: str, requester_id: int, channel_id: int, plan: Dict[str, Any]):
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT OR REPLACE INTO pending_plans(plan_id, created_at, requester_id, channel_id, plan_json) VALUES(?,?,?,?,?)",
-        (plan_id, int(time.time()), requester_id, channel_id, json.dumps(plan, ensure_ascii=False))
-    )
-    conn.commit()
-    conn.close()
-
-def pending_load(plan_id: str) -> Optional[Dict[str, Any]]:
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("SELECT plan_json FROM pending_plans WHERE plan_id=?", (plan_id,))
-    row = cur.fetchone()
-    conn.close()
-    if not row:
-        return None
-    return json.loads(row[0])
-
-def pending_delete(plan_id: str):
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM pending_plans WHERE plan_id=?", (plan_id,))
-    conn.commit()
-    conn.close()
-
-# =========================
-# OPENAI CLIENT
-# =========================
-client_ai = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-
-# =========================
-# DISCORD BOT SETUP
-# =========================
-intents = discord.Intents.default()
-intents.guilds = True
-intents.members = True
-intents.message_content = True  # REQUIRED for reading messages / moderation / delete-last-message
-
-bot = commands.Bot(command_prefix="!", intents=intents)
-
-# =========================
-# HELPERS
-# =========================
-def is_paid_member(member: discord.Member) -> bool:
-    role_names = {r.name for r in member.roles}
-    if role_names.intersection(set(PAID_ROLES)):
-        return True
-    # admins unlimited
-    if member.guild_permissions.administrator:
-        return True
-    if ROLE_ADMINISTRATOR in role_names or ROLE_AI_ADMIN in role_names:
-        return True
-    return False
-
-def is_admin_operator(member: discord.Member) -> bool:
-    # Owner OR has Admin perms OR has AI Admin role OR has "Administrator" role (your naming)
-    if member.guild_permissions.administrator:
-        return True
-    role_names = {r.name for r in member.roles}
-    if ROLE_AI_ADMIN in role_names or ROLE_ADMINISTRATOR in role_names:
-        return True
-    return False
-
-def normalize_channel_name(ch: discord.abc.GuildChannel) -> str:
-    return getattr(ch, "name", "").lower()
-
-def is_public_ai_channel(channel: discord.abc.GuildChannel) -> bool:
-    name = normalize_channel_name(channel)
-    return name in {c.lower() for c in PUBLIC_AI_CHANNELS}
-
-def is_ai_admin_channel(channel: discord.abc.GuildChannel) -> bool:
-    return normalize_channel_name(channel) == AI_ADMIN_CHANNEL_NAME.lower()
-
-def find_channel_by_name(guild: discord.Guild, name: str) -> Optional[discord.TextChannel]:
-    name = name.lower()
-    for ch in guild.text_channels:
-        if ch.name.lower() == name:
-            return ch
-    return None
-
-def strip_bot_mention(content: str) -> str:
-    # Remove <@id> / <@!id> mentions + the word "Nexora AI"
-    content = re.sub(r"<@!?(\d+)>", "", content).strip()
-    content = re.sub(r"\bNexora\s*AI\b", "", content, flags=re.IGNORECASE).strip()
-    return content
-
-def safe_short(s: str, n: int = 1500) -> str:
-    if len(s) <= n:
-        return s
-    return s[: n - 3] + "..."
-
-# =========================
-# MODERATION (soft)
-# =========================
-async def moderation_check(text: str) -> Tuple[bool, str]:
-    """
-    Returns (is_problematic, reason_short)
-    We do NOT auto-punish. We only warn + log.
-    """
-    # Simple fast heuristic to avoid calling API on every message
-    bad_words = ["сука", "бляд", "еб", "fuck", "bitch", "cunt"]
-    if any(w in text.lower() for w in bad_words):
-        # still confirm with model if available
-        pass
-    if not client_ai:
-        return (False, "")
-
-    prompt = (
-        "You are a moderation classifier for a Discord community.\n"
-        "Classify if the message contains harassment, hate, threats, explicit sexual content, doxxing, or severe profanity.\n"
-        "Return JSON only: {\"problem\": true/false, \"reason\": \"short\"}.\n\n"
-        f"Message:\n{text}"
-    )
-    try:
-        resp = client_ai.responses.create(
-            model=MODEL_MODERATION,
-            input=prompt,
-        )
-        out = resp.output_text.strip()
-        data = json.loads(out)
-        return (bool(data.get("problem", False)), str(data.get("reason", ""))[:120])
-    except Exception:
-        return (False, "")
-
-async def log_audit(guild: discord.Guild, text: str):
-    ch = find_channel_by_name(guild, AI_AUDIT_CHANNEL_NAME)
-    if ch:
-        await ch.send(safe_short(text, 1800))
-
-# =========================
-# SERVER HELP ASSISTANT (public)
-# =========================
-async def generate_public_reply(user_text: str, member: discord.Member) -> str:
-    """
-    Friendly helper about server usage.
-    Must NOT mention ai-admin or internal admin channels.
-    """
-    if not client_ai:
-        # fallback minimal
-        return "Я онлайн. Задай вопрос по серверу Nexora (тикеты, роли, торговые правила) — и я помогу."
-
-    role_names = [r.name for r in member.roles if r.name != "@everyone"]
-    context = (
-        "You are Nexora AI — a friendly Discord server helper.\n"
-        "You help users understand how to use the Nexora server, its channels, tickets, trade flow, reputation, and rules.\n"
-        "CRITICAL RULES:\n"
-        "- NEVER mention any admin-only channels or internal admin process.\n"
-        "- If user asks for admin actions, say they should contact the server staff.\n"
-        "- Reply in the user's language if possible.\n"
-        "- Be concise, practical, and specific.\n"
-        "- If the question is unclear, ask ONE short clarifying question.\n"
-        "\n"
-        f"User roles: {', '.join(role_names) if role_names else 'none'}\n"
-        f"User message: {user_text}\n"
-    )
-
-    resp = client_ai.responses.create(
-        model=MODEL_ASSIST,
-        input=context,
-    )
-    return resp.output_text.strip() or "Ок. Скажи, что именно ты хочешь сделать на сервере — и я подскажу шаги."
-
-# =========================
-# ADMIN ACTIONS (execute)
-# =========================
-async def action_create_text_channel(guild: discord.Guild, name: str, category: Optional[str] = None) -> str:
-    cat_obj = None
-    if category:
-        for c in guild.categories:
-            if c.name.lower() == category.lower():
-                cat_obj = c
-                break
-    ch = await guild.create_text_channel(name=name, category=cat_obj)
-    return f"✅ Created text channel: #{ch.name} (id={ch.id})"
-
-async def action_send_message(guild: discord.Guild, channel: str, content: str, pin: bool = False) -> str:
-    ch = None
-    # allow #name or name
-    channel_name = channel.replace("#", "").strip().lower()
-    ch = find_channel_by_name(guild, channel_name)
-    if not ch:
-        return f"❌ Channel not found: {channel}"
-    msg = await ch.send(content)
-    if pin:
-        try:
-            await msg.pin(reason="Nexora AI pin")
-        except discord.Forbidden:
-            return f"⚠️ Sent message but cannot pin (missing permissions). msg_id={msg.id}"
-    return f"✅ Sent message to #{ch.name} (msg_id={msg.id})" + (" and pinned" if pin else "")
-
-async def action_delete_last_message_by_user(guild: discord.Guild, channel: str, user: str, limit_scan: int = 50) -> str:
-    """
-    Deletes the most recent message in a channel authored by a user (by @mention or username).
-    """
-    channel_name = channel.replace("#", "").strip().lower()
-    ch = find_channel_by_name(guild, channel_name)
-    if not ch:
-        return f"❌ Channel not found: {channel}"
-
-    # resolve user
-    target_id = None
-    m = re.search(r"<@!?(\d+)>", user)
-    if m:
-        target_id = int(m.group(1))
-    target_member = None
-    if target_id:
-        target_member = guild.get_member(target_id)
-    if not target_member:
-        # try by name/nick
-        uname = user.replace("@", "").strip().lower()
-        for mem in guild.members:
-            if mem.name.lower() == uname or (mem.display_name and mem.display_name.lower() == uname):
-                target_member = mem
-                break
-
-    if not target_member:
-        return f"❌ User not found: {user}"
-
-    try:
-        async for msg in ch.history(limit=limit_scan, oldest_first=False):
-            if msg.author.id == target_member.id:
-                await msg.delete(reason="Nexora AI admin request: delete last message by user")
-                return f"✅ Deleted last message by {target_member} in #{ch.name} (msg_id={msg.id})"
-        return f"⚠️ No recent messages by {target_member} found in last {limit_scan} messages."
-    except discord.Forbidden:
-        return "❌ Missing permissions: need Read Message History + Manage Messages."
-    except Exception as e:
-        return f"❌ Error deleting message: {type(e).__name__}: {e}"
-
-async def action_assign_role(guild: discord.Guild, user_id: int, role_name: str) -> str:
-    mem = guild.get_member(user_id)
-    if not mem:
-        return f"❌ User not found in guild: {user_id}"
-    role = discord.utils.get(guild.roles, name=role_name)
-    if not role:
-        return f"❌ Role not found: {role_name}"
-    try:
-        await mem.add_roles(role, reason="Nexora AI admin request: assign role")
-        return f"✅ Assigned role '{role.name}' to {mem}."
-    except discord.Forbidden:
-        return "❌ Cannot assign role (permission/role hierarchy issue)."
-    except Exception as e:
-        return f"❌ Error: {type(e).__name__}: {e}"
-
-# Registry of executable actions
-ACTION_FUNCS = {
-    "create_text_channel": action_create_text_channel,
-    "send_message": action_send_message,
-    "delete_last_message_by_user": action_delete_last_message_by_user,
-    "assign_role": action_assign_role,
-}
-
-# =========================
-# ADMIN PLANNER (LLM -> plan JSON with actions)
-# =========================
-ADMIN_TOOLS = [
-   import os
-import re
-import json
-import time
-import sqlite3
-import datetime as dt
-from typing import Any, Dict, List, Optional, Tuple
-
-import discord
-from discord import app_commands
-from discord.ext import commands
-
-# OpenAI (python package: openai>=1.0.0)
-from openai import OpenAI
-
-# =========================
-# CONFIG (ENV)
-# =========================
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-
-# You can configure by name OR by ID (recommended).
-GUILD_ID = int(os.getenv("GUILD_ID", "0") or "0")
-
-AI_ADMIN_CHANNEL_NAME = os.getenv("AI_ADMIN_CHANNEL_NAME", "ai-admin").strip()   # hidden channel
-AI_AUDIT_CHANNEL_NAME = os.getenv("AI_AUDIT_CHANNEL_NAME", "ai-audit-log").strip()
-
-# Public support/help channels where bot answers users
-PUBLIC_AI_CHANNELS = [c.strip() for c in os.getenv("PUBLIC_AI_CHANNELS", "ai-help,ai-support,ai-guide").split(",") if c.strip()]
-
-# Roles
-ROLE_AI_ADMIN = os.getenv("ROLE_AI_ADMIN", "AI Admin").strip()
-ROLE_ADMINISTRATOR = os.getenv("ROLE_ADMINISTRATOR", "Administrator").strip()
-
-PAID_ROLES = [r.strip() for r in os.getenv("PAID_ROLES", "Nexora Pro,Nexora Elite,Nexora Ultra").split(",") if r.strip()]
-
-# Limits
-FREE_DAILY_LIMIT = int(os.getenv("FREE_DAILY_LIMIT", "10") or "10")
-
-# Models
-MODEL_ASSIST = os.getenv("MODEL_ASSIST", "gpt-4.1-mini")
-MODEL_ADMIN = os.getenv("MODEL_ADMIN", "gpt-4.1-mini")
-MODEL_MODERATION = os.getenv("MODEL_MODERATION", "gpt-4.1-mini")
-
-# Misc
-DB_PATH = os.getenv("DB_PATH", "nexora.db")
-
-# =========================
-# SAFETY: NEVER MENTION AI-ADMIN TO USERS
-# =========================
-USER_FACING_ADMIN_REDIRECT = (
-    "Для админ-действий напиши администрации сервера. "
-    "Я здесь как помощник по использованию Nexora и его функций."
-)
-
-WELCOME_BLURB = (
-    "Я Nexora AI — дружелюбный помощник по серверу Nexora.\n"
-    "Могу подсказать, как пользоваться функциями сервера, торговыми каналами, тикетами и правилами.\n"
-    "Напиши вопрос прямо сюда и укажи, что именно хочешь сделать."
-)
-
-# =========================
-# DATABASE
-# =========================
-def db_connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    return conn
 
 def db_init():
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS usage_daily (
-        user_id INTEGER NOT NULL,
-        day TEXT NOT NULL,
-        count INTEGER NOT NULL,
-        PRIMARY KEY (user_id, day)
-    )
-    """)
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS user_state (
-        user_id INTEGER PRIMARY KEY,
-        greeted INTEGER NOT NULL DEFAULT 0
-    )
-    """)
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS pending_plans (
-        plan_id TEXT PRIMARY KEY,
-        created_at INTEGER NOT NULL,
-        requester_id INTEGER NOT NULL,
-        channel_id INTEGER NOT NULL,
-        plan_json TEXT NOT NULL
-    )
-    """)
-    conn.commit()
-    conn.close()
+    with _db() as c:
+        c.executescript("""
+            CREATE TABLE IF NOT EXISTS message_counts (
+                user_id  INTEGER NOT NULL,
+                date_utc TEXT    NOT NULL,
+                count    INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (user_id, date_utc)
+            );
+            CREATE TABLE IF NOT EXISTS user_memory (
+                user_id       INTEGER PRIMARY KEY,
+                language      TEXT DEFAULT 'en',
+                last_seen_utc TEXT
+            );
+        """)
 
-def today_key_utc() -> str:
-    return dt.datetime.utcnow().strftime("%Y-%m-%d")
 
-def usage_get(user_id: int) -> int:
-    conn = db_connect()
-    cur = conn.cursor()
-    day = today_key_utc()
-    cur.execute("SELECT count FROM usage_daily WHERE user_id=? AND day=?", (user_id, day))
-    row = cur.fetchone()
-    conn.close()
-    return int(row[0]) if row else 0
+def _today() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-def usage_inc(user_id: int) -> int:
-    conn = db_connect()
-    cur = conn.cursor()
-    day = today_key_utc()
-    cur.execute("SELECT count FROM usage_daily WHERE user_id=? AND day=?", (user_id, day))
-    row = cur.fetchone()
-    if row:
-        new_count = int(row[0]) + 1
-        cur.execute("UPDATE usage_daily SET count=? WHERE user_id=? AND day=?", (new_count, user_id, day))
-    else:
-        new_count = 1
-        cur.execute("INSERT INTO usage_daily(user_id, day, count) VALUES(?,?,?)", (user_id, day, new_count))
-    conn.commit()
-    conn.close()
-    return new_count
 
-def greeted_get(user_id: int) -> bool:
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("SELECT greeted FROM user_state WHERE user_id=?", (user_id,))
-    row = cur.fetchone()
-    conn.close()
-    return bool(row and int(row[0]) == 1)
+def db_get_count(user_id: int) -> int:
+    with _db() as c:
+        row = c.execute(
+            "SELECT count FROM message_counts WHERE user_id=? AND date_utc=?",
+            (user_id, _today()),
+        ).fetchone()
+    return row["count"] if row else 0
 
-def greeted_set(user_id: int):
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("INSERT INTO user_state(user_id, greeted) VALUES(?,1) ON CONFLICT(user_id) DO UPDATE SET greeted=1", (user_id,))
-    conn.commit()
-    conn.close()
 
-def pending_save(plan_id: str, requester_id: int, channel_id: int, plan: Dict[str, Any]):
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT OR REPLACE INTO pending_plans(plan_id, created_at, requester_id, channel_id, plan_json) VALUES(?,?,?,?,?)",
-        (plan_id, int(time.time()), requester_id, channel_id, json.dumps(plan, ensure_ascii=False))
-    )
-    conn.commit()
-    conn.close()
-
-def pending_load(plan_id: str) -> Optional[Dict[str, Any]]:
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("SELECT plan_json FROM pending_plans WHERE plan_id=?", (plan_id,))
-    row = cur.fetchone()
-    conn.close()
-    if not row:
-        return None
-    return json.loads(row[0])
-
-def pending_delete(plan_id: str):
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM pending_plans WHERE plan_id=?", (plan_id,))
-    conn.commit()
-    conn.close()
-
-# =========================
-# OPENAI CLIENT
-# =========================
-client_ai = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-
-# =========================
-# DISCORD BOT SETUP
-# =========================
-intents = discord.Intents.default()
-intents.guilds = True
-intents.members = True
-intents.message_content = True  # REQUIRED for reading messages / moderation / delete-last-message
-
-bot = commands.Bot(command_prefix="!", intents=intents)
-
-# =========================
-# HELPERS
-# =========================
-def is_paid_member(member: discord.Member) -> bool:
-    role_names = {r.name for r in member.roles}
-    if role_names.intersection(set(PAID_ROLES)):
-        return True
-    # admins unlimited
-    if member.guild_permissions.administrator:
-        return True
-    if ROLE_ADMINISTRATOR in role_names or ROLE_AI_ADMIN in role_names:
-        return True
-    return False
-
-def is_admin_operator(member: discord.Member) -> bool:
-    # Owner OR has Admin perms OR has AI Admin role OR has "Administrator" role (your naming)
-    if member.guild_permissions.administrator:
-        return True
-    role_names = {r.name for r in member.roles}
-    if ROLE_AI_ADMIN in role_names or ROLE_ADMINISTRATOR in role_names:
-        return True
-    return False
-
-def normalize_channel_name(ch: discord.abc.GuildChannel) -> str:
-    return getattr(ch, "name", "").lower()
-
-def is_public_ai_channel(channel: discord.abc.GuildChannel) -> bool:
-    name = normalize_channel_name(channel)
-    return name in {c.lower() for c in PUBLIC_AI_CHANNELS}
-
-def is_ai_admin_channel(channel: discord.abc.GuildChannel) -> bool:
-    return normalize_channel_name(channel) == AI_ADMIN_CHANNEL_NAME.lower()
-
-def find_channel_by_name(guild: discord.Guild, name: str) -> Optional[discord.TextChannel]:
-    name = name.lower()
-    for ch in guild.text_channels:
-        if ch.name.lower() == name:
-            return ch
-    return None
-
-def strip_bot_mention(content: str) -> str:
-    # Remove <@id> / <@!id> mentions + the word "Nexora AI"
-    content = re.sub(r"<@!?(\d+)>", "", content).strip()
-    content = re.sub(r"\bNexora\s*AI\b", "", content, flags=re.IGNORECASE).strip()
-    return content
-
-def safe_short(s: str, n: int = 1500) -> str:
-    if len(s) <= n:
-        return s
-    return s[: n - 3] + "..."
-
-# =========================
-# MODERATION (soft)
-# =========================
-async def moderation_check(text: str) -> Tuple[bool, str]:
-    """
-    Returns (is_problematic, reason_short)
-    We do NOT auto-punish. We only warn + log.
-    """
-    # Simple fast heuristic to avoid calling API on every message
-    bad_words = ["сука", "бляд", "еб", "fuck", "bitch", "cunt"]
-    if any(w in text.lower() for w in bad_words):
-        # still confirm with model if available
-        pass
-    if not client_ai:
-        return (False, "")
-
-    prompt = (
-        "You are a moderation classifier for a Discord community.\n"
-        "Classify if the message contains harassment, hate, threats, explicit sexual content, doxxing, or severe profanity.\n"
-        "Return JSON only: {\"problem\": true/false, \"reason\": \"short\"}.\n\n"
-        f"Message:\n{text}"
-    )
-    try:
-        resp = client_ai.responses.create(
-            model=MODEL_MODERATION,
-            input=prompt,
+def db_increment(user_id: int) -> int:
+    today = _today()
+    with _db() as c:
+        c.execute(
+            """INSERT INTO message_counts (user_id, date_utc, count) VALUES (?,?,1)
+               ON CONFLICT(user_id, date_utc) DO UPDATE SET count = count + 1""",
+            (user_id, today),
         )
-        out = resp.output_text.strip()
-        data = json.loads(out)
-        return (bool(data.get("problem", False)), str(data.get("reason", ""))[:120])
-    except Exception:
-        return (False, "")
+        row = c.execute(
+            "SELECT count FROM message_counts WHERE user_id=? AND date_utc=?",
+            (user_id, today),
+        ).fetchone()
+    return row["count"]
 
-async def log_audit(guild: discord.Guild, text: str):
-    ch = find_channel_by_name(guild, AI_AUDIT_CHANNEL_NAME)
+
+def db_get_lang(user_id: int) -> str:
+    with _db() as c:
+        row = c.execute("SELECT language FROM user_memory WHERE user_id=?", (user_id,)).fetchone()
+    return row["language"] if row else "en"
+
+
+def db_upsert_memory(user_id: int, language: str):
+    now = datetime.now(timezone.utc).isoformat()
+    with _db() as c:
+        c.execute(
+            """INSERT INTO user_memory (user_id, language, last_seen_utc) VALUES (?,?,?)
+               ON CONFLICT(user_id) DO UPDATE SET language=excluded.language,
+               last_seen_utc=excluded.last_seen_utc""",
+            (user_id, language, now),
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def is_paid(member: discord.Member) -> bool:
+    return bool({r.name for r in member.roles} & set(PAID_ROLES))
+
+
+def is_admin(member: discord.Member) -> bool:
+    """Owner OR has 'AI Admin' role."""
+    if member.id == OWNER_ID:
+        return True
+    return any(r.name == "AI Admin" for r in member.roles)
+
+
+def sanitize(text: str) -> str:
+    """Strip any accidental admin-channel leakage from public-facing text."""
+    return _HIDDEN_PATTERN.sub("[server administration]", text)
+
+
+def detect_lang(text: str) -> str:
+    if re.search(r"[а-яёА-ЯЁ]", text):
+        return "ru"
+    return "en"
+
+
+async def audit(guild: discord.Guild, msg: str):
+    ch = discord.utils.get(guild.text_channels, name=AUDIT_CHANNEL_NAME)
     if ch:
-        await ch.send(safe_short(text, 1800))
-
-# =========================
-# SERVER HELP ASSISTANT (public)
-# =========================
-async def generate_public_reply(user_text: str, member: discord.Member) -> str:
-    """
-    Friendly helper about server usage.
-    Must NOT mention ai-admin or internal admin channels.
-    """
-    if not client_ai:
-        # fallback minimal
-        return "Я онлайн. Задай вопрос по серверу Nexora (тикеты, роли, торговые правила) — и я помогу."
-
-    role_names = [r.name for r in member.roles if r.name != "@everyone"]
-    context = (
-        "You are Nexora AI — a friendly Discord server helper.\n"
-        "You help users understand how to use the Nexora server, its channels, tickets, trade flow, reputation, and rules.\n"
-        "CRITICAL RULES:\n"
-        "- NEVER mention any admin-only channels or internal admin process.\n"
-        "- If user asks for admin actions, say they should contact the server staff.\n"
-        "- Reply in the user's language if possible.\n"
-        "- Be concise, practical, and specific.\n"
-        "- If the question is unclear, ask ONE short clarifying question.\n"
-        "\n"
-        f"User roles: {', '.join(role_names) if role_names else 'none'}\n"
-        f"User message: {user_text}\n"
-    )
-
-    resp = client_ai.responses.create(
-        model=MODEL_ASSIST,
-        input=context,
-    )
-    return resp.output_text.strip() or "Ок. Скажи, что именно ты хочешь сделать на сервере — и я подскажу шаги."
-
-# =========================
-# ADMIN ACTIONS (execute)
-# =========================
-async def action_create_text_channel(guild: discord.Guild, name: str, category: Optional[str] = None) -> str:
-    cat_obj = None
-    if category:
-        for c in guild.categories:
-            if c.name.lower() == category.lower():
-                cat_obj = c
-                break
-    ch = await guild.create_text_channel(name=name, category=cat_obj)
-    return f"✅ Created text channel: #{ch.name} (id={ch.id})"
-
-async def action_send_message(guild: discord.Guild, channel: str, content: str, pin: bool = False) -> str:
-    ch = None
-    # allow #name or name
-    channel_name = channel.replace("#", "").strip().lower()
-    ch = find_channel_by_name(guild, channel_name)
-    if not ch:
-        return f"❌ Channel not found: {channel}"
-    msg = await ch.send(content)
-    if pin:
         try:
-            await msg.pin(reason="Nexora AI pin")
-        except discord.Forbidden:
-            return f"⚠️ Sent message but cannot pin (missing permissions). msg_id={msg.id}"
-    return f"✅ Sent message to #{ch.name} (msg_id={msg.id})" + (" and pinned" if pin else "")
+            await ch.send(f"```\n{msg[:1990]}\n```")
+        except Exception as e:
+            log.warning("audit send failed: %s", e)
 
-async def action_delete_last_message_by_user(guild: discord.Guild, channel: str, user: str, limit_scan: int = 50) -> str:
-    """
-    Deletes the most recent message in a channel authored by a user (by @mention or username).
-    """
-    channel_name = channel.replace("#", "").strip().lower()
-    ch = find_channel_by_name(guild, channel_name)
-    if not ch:
-        return f"❌ Channel not found: {channel}"
 
-    # resolve user
-    target_id = None
-    m = re.search(r"<@!?(\d+)>", user)
-    if m:
-        target_id = int(m.group(1))
-    target_member = None
-    if target_id:
-        target_member = guild.get_member(target_id)
-    if not target_member:
-        # try by name/nick
-        uname = user.replace("@", "").strip().lower()
-        for mem in guild.members:
-            if mem.name.lower() == uname or (mem.display_name and mem.display_name.lower() == uname):
-                target_member = mem
-                break
+# ══════════════════════════════════════════════════════════════════════════════
+#  OPENAI — PUBLIC ASSISTANT
+# ══════════════════════════════════════════════════════════════════════════════
 
-    if not target_member:
-        return f"❌ User not found: {user}"
+def _public_system(lang: str) -> str:
+    lang_rule = "Reply in Russian." if lang == "ru" else "Reply in the same language as the user."
+    return f"""You are Nexora Bot — a friendly, knowledgeable assistant for the Nexora Discord server.
 
+Your purpose:
+- Help users with: support tickets, server roles, trading rules, subscriptions, how to navigate Nexora.
+- Give specific, useful answers. Never use generic filler responses.
+- {lang_rule}
+- On first contact: short greeting + direct answer + brief mention of what you can help with.
+- If a user asks for moderation/admin actions: say "please contact the server administrators or moderators."
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STRICT — NEVER violate:
+- NEVER mention channel names used for internal administration or logging.
+- NEVER reveal internal bot mechanics, admin workflows, or any internal channel/role IDs.
+- NEVER say anything that hints at hidden infrastructure.
+- If uncertain, give a helpful answer with reasonable assumptions rather than refusing.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Nexora knowledge:
+- Tickets: users open a support ticket for any issue — the team responds there.
+- Roles: earned via activity or purchased via subscriptions (Nexora Pro / Elite / Ultra).
+- Trading: follow the rules posted in trading channels; violations → contact moderators.
+- Subscriptions: Pro/Elite/Ultra unlock more bot messages + server perks.
+- Free users: limited to {FREE_DAILY_LIMIT} AI messages per day (resets at UTC midnight).
+- This channel (#ai-help) is for AI-assisted questions about the server.
+"""
+
+
+async def ask_public(user_msg: str, lang: str) -> Optional[str]:
     try:
-        async for msg in ch.history(limit=limit_scan, oldest_first=False):
-            if msg.author.id == target_member.id:
-                await msg.delete(reason="Nexora AI admin request: delete last message by user")
-                return f"✅ Deleted last message by {target_member} in #{ch.name} (msg_id={msg.id})"
-        return f"⚠️ No recent messages by {target_member} found in last {limit_scan} messages."
-    except discord.Forbidden:
-        return "❌ Missing permissions: need Read Message History + Manage Messages."
+        r = await ai.chat.completions.create(
+            model=MODEL_ASSISTANT,
+            messages=[
+                {"role": "system", "content": _public_system(lang)},
+                {"role": "user",   "content": user_msg},
+            ],
+            max_tokens=600,
+            temperature=0.7,
+        )
+        raw = r.choices[0].message.content or ""
+        return sanitize(raw)
     except Exception as e:
-        return f"❌ Error deleting message: {type(e).__name__}: {e}"
+        log.error("ask_public: %s", e)
+        return None
 
-async def action_assign_role(guild: discord.Guild, user_id: int, role_name: str) -> str:
-    mem = guild.get_member(user_id)
-    if not mem:
-        return f"❌ User not found in guild: {user_id}"
-    role = discord.utils.get(guild.roles, name=role_name)
-    if not role:
-        return f"❌ Role not found: {role_name}"
-    try:
-        await mem.add_roles(role, reason="Nexora AI admin request: assign role")
-        return f"✅ Assigned role '{role.name}' to {mem}."
-    except discord.Forbidden:
-        return "❌ Cannot assign role (permission/role hierarchy issue)."
-    except Exception as e:
-        return f"❌ Error: {type(e).__name__}: {e}"
 
-# Registry of executable actions
-ACTION_FUNCS = {
-    "create_text_channel": action_create_text_channel,
-    "send_message": action_send_message,
-    "delete_last_message_by_user": action_delete_last_message_by_user,
-    "assign_role": action_assign_role,
-}
+# ══════════════════════════════════════════════════════════════════════════════
+#  OPENAI — ADMIN PLANNER (function-calling)
+# ══════════════════════════════════════════════════════════════════════════════
 
-# =========================
-# ADMIN PLANNER (LLM -> plan JSON with actions)
-# =========================
+# All tools properly defined: type + function.name + function.description + function.parameters
 ADMIN_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "create_text_channel",
-            "description": "Create a new text channel",
+            "name": "delete_last_message",
+            "description": "Delete the most recent message from a specific user in a channel.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "name": {"type": "string"},
-                    "category": {"type": "string", "nullable": True},
+                    "username":     {"type": "string", "description": "Discord username or display name (no @)."},
+                    "channel_name": {"type": "string", "description": "Target channel name (no #)."},
                 },
-                "required": ["name"]
-            }
-        }
+                "required": ["username", "channel_name"],
+            },
+        },
     },
     {
         "type": "function",
         "function": {
-            "name": "send_message",
-            "description": "Send a message to a channel (optionally pin it)",
+            "name": "create_channel",
+            "description": "Create a new text channel in the server.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "channel": {"type": "string"},
-                    "content": {"type": "string"},
-                    "pin": {"type": "boolean"}
+                    "channel_name":  {"type": "string", "description": "Name for the new channel."},
+                    "category_name": {"type": "string", "description": "Category to place channel in (optional)."},
+                    "private":       {"type": "boolean", "description": "True = admin-only, False = public."},
                 },
-                "required": ["channel", "content"]
-            }
-        }
+                "required": ["channel_name"],
+            },
+        },
     },
     {
         "type": "function",
         "function": {
-            "name": "delete_last_message_by_user",
-            "description": "Delete the most recent message by a user in a channel (no message ID needed).",
+            "name": "delete_channel",
+            "description": "Delete an existing text channel.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "channel": {"type": "string"},
-                    "user": {"type": "string"},
-                    "limit_scan": {"type": "integer"}
+                    "channel_name": {"type": "string", "description": "Channel name to delete (no #)."},
                 },
-                "required": ["channel", "user"]
-            }
-        }
+                "required": ["channel_name"],
+            },
+        },
     },
     {
         "type": "function",
         "function": {
-            "name": "assign_role",
-            "description": "Assign a role to a user by user_id",
+            "name": "kick_member",
+            "description": "Kick a member from the server.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "user_id": {"type": "integer"},
-                    "role_name": {"type": "string"}
+                    "username": {"type": "string", "description": "Username to kick."},
+                    "reason":   {"type": "string", "description": "Reason for kick."},
                 },
-                "required": ["user_id", "role_name"]
-            }
-        }
+                "required": ["username"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ban_member",
+            "description": "Ban a member from the server.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "username":    {"type": "string", "description": "Username to ban."},
+                    "reason":      {"type": "string", "description": "Reason for ban."},
+                    "delete_days": {"type": "integer", "description": "Days of messages to delete (0–7)."},
+                },
+                "required": ["username"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_slowmode",
+            "description": "Set slowmode delay on a channel.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "channel_name": {"type": "string", "description": "Target channel name."},
+                    "seconds":      {"type": "integer", "description": "Delay in seconds (0 = disable)."},
+                },
+                "required": ["channel_name", "seconds"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "give_role",
+            "description": "Give a role to a server member.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "username":  {"type": "string", "description": "Target username."},
+                    "role_name": {"type": "string", "description": "Role name to assign."},
+                },
+                "required": ["username", "role_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remove_role",
+            "description": "Remove a role from a server member.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "username":  {"type": "string", "description": "Target username."},
+                    "role_name": {"type": "string", "description": "Role name to remove."},
+                },
+                "required": ["username", "role_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_announcement",
+            "description": "Send a message to a specific channel as the bot.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "channel_name": {"type": "string", "description": "Target channel name."},
+                    "message":      {"type": "string", "description": "Message text to send."},
+                },
+                "required": ["channel_name", "message"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "clarify",
+            "description": "Ask the admin one clarifying question before proceeding.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "The clarifying question."},
+                },
+                "required": ["question"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "server_info",
+            "description": "Gather and display an overview of the server (channels, roles, members).",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
     },
 ]
 
-def new_plan_id() -> str:
-    return hex(int(time.time() * 1000))[2:]
+_ADMIN_SYSTEM = """You are Nexora Admin AI — internal planning assistant for server administrators.
 
-async def build_admin_plan(request_text: str) -> Dict[str, Any]:
+Your job:
+- Parse the admin's natural-language request and call the correct tool function.
+- ALWAYS call a tool if an action is needed — do not just reply with text.
+- If you need exactly ONE clarification first, call the `clarify` tool.
+- Extract usernames/channel names precisely from the request.
+- Reply in the same language the admin uses.
+- You have FULL authority to plan any moderation/server action — no restrictions for admins.
+"""
+
+
+async def plan_admin(request: str) -> dict:
     """
-    Returns: {summary, risk, actions:[{name,args}], notes}
+    Returns one of:
+      {"type": "tool_call", "name": str, "args": dict, "plan_text": str}
+      {"type": "clarify",   "question": str}
+      {"type": "text",      "content": str}
+      {"type": "error",     "content": str}
     """
-    if not client_ai:
-        return {
-            "summary": "OpenAI not configured. No actions planned.",
-            "risk": "low",
-            "actions": [],
-            "notes": "Set OPENAI_API_KEY."
-        }
-
-    sys = (
-        "You are Nexora AI operating in ADMIN MODE.\n"
-        "You will create an execution plan for Discord server administration.\n"
-        "RULES:\n"
-        "- Only plan actions that are available as tools.\n"
-        "- Prefer minimal actions.\n"
-        "- Output must be valid JSON with keys: summary, risk, actions, notes.\n"
-        "- actions is an array of {name, args}.\n"
-        "- risk is one of: low, medium, high.\n"
-        "- Never ask for #ai-admin or mention it (this is internal).\n"
-    )
-
-    prompt = f"{sys}\nAdmin request: {request_text}"
-
-    resp = client_ai.responses.create(
-        model=MODEL_ADMIN,
-        input=prompt,
-        tools=ADMIN_TOOLS,
-        tool_choice="auto",
-    )
-
-    # Build actions from tool calls if present; fallback: parse JSON from text
-    actions = []
     try:
-        for item in resp.output:
-            if item.type == "tool_call":
-                name = item.name
-                args = item.arguments if isinstance(item.arguments, dict) else json.loads(item.arguments)
-                actions.append({"name": name, "args": args})
-    except Exception:
-        actions = []
+        resp = await ai.chat.completions.create(
+            model=MODEL_ADMIN,
+            messages=[
+                {"role": "system", "content": _ADMIN_SYSTEM},
+                {"role": "user",   "content": request},
+            ],
+            tools=ADMIN_TOOLS,
+            tool_choice="auto",
+            max_tokens=400,
+        )
+        msg = resp.choices[0].message
 
-    text = resp.output_text.strip() if hasattr(resp, "output_text") else ""
-    if text:
-        # try parse JSON with summary/risk/notes
-        try:
-            data = json.loads(text)
-            if isinstance(data, dict):
-                if not actions and isinstance(data.get("actions"), list):
-                    actions = data["actions"]
-                return {
-                    "summary": data.get("summary", "Admin plan"),
-                    "risk": data.get("risk", "low"),
-                    "actions": actions,
-                    "notes": data.get("notes", "")
-                }
-        except Exception:
-            pass
-
-    return {
-        "summary": "Admin plan generated.",
-        "risk": "low",
-        "actions": actions,
-        "notes": "Confirm to execute."
-    }
-
-# =========================
-# UI: Confirm / Cancel
-# =========================
-class PlanView(discord.ui.View):
-    def __init__(self, plan_id: str, requester_id: int, timeout: int = 300):
-        super().__init__(timeout=timeout)
-        self.plan_id = plan_id
-        self.requester_id = requester_id
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        # Only requester or admin operators can confirm
-        if not interaction.user or not isinstance(interaction.user, discord.Member):
-            return False
-        if interaction.user.id == self.requester_id:
-            return True
-        return is_admin_operator(interaction.user)
-
-    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.success)
-    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)
-
-        plan = pending_load(self.plan_id)
-        if not plan:
-            await interaction.followup.send("❌ Plan not found or expired.", ephemeral=True)
-            return
-
-        guild = interaction.guild
-        if not guild:
-            await interaction.followup.send("❌ No guild context.", ephemeral=True)
-            return
-
-        results = []
-        for act in plan.get("actions", []):
-            name = act.get("name")
-            args = act.get("args", {}) or {}
-            fn = ACTION_FUNCS.get(name)
-            if not fn:
-                results.append(f"⚠️ Unknown action: {name}")
-                continue
+        if msg.tool_calls:
+            tc   = msg.tool_calls[0]
+            name = tc.function.name
             try:
-                res = await fn(guild, **args)
-                results.append(res)
-            except TypeError as e:
-                results.append(f"❌ Bad args for {name}: {e}")
-            except Exception as e:
-                results.append(f"❌ {name} failed: {type(e).__name__}: {e}")
+                args = json.loads(tc.function.arguments)
+            except json.JSONDecodeError:
+                args = {}
 
-        pending_delete(self.plan_id)
+            if name == "clarify":
+                return {"type": "clarify", "question": args.get("question", "Could you clarify?")}
 
-        out = "\n".join(results) if results else "No actions executed."
-        await interaction.followup.send(safe_short(out, 1900), ephemeral=True)
-        await log_audit(guild, f"✅ EXECUTED plan {self.plan_id} by {interaction.user}:\n{out}")
+            return {
+                "type": "tool_call",
+                "name": name,
+                "args": args,
+                "plan_text": _plan_text(name, args),
+            }
 
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger)
+        return {"type": "text", "content": msg.content or "OK."}
+
+    except Exception as e:
+        log.error("plan_admin: %s", e)
+        return {"type": "error", "content": str(e)}
+
+
+def _plan_text(name: str, args: dict) -> str:
+    templates = {
+        "delete_last_message": (
+            f"🗑️ **Delete last message** by `{args.get('username')}` "
+            f"in `#{args.get('channel_name')}`"
+        ),
+        "create_channel": (
+            f"➕ **Create channel** `#{args.get('channel_name')}`"
+            + (f" in `{args.get('category_name')}`" if args.get("category_name") else "")
+            + (" *(private)*" if args.get("private") else " *(public)*")
+        ),
+        "delete_channel": f"❌ **Delete channel** `#{args.get('channel_name')}`",
+        "kick_member":    (
+            f"👢 **Kick** `{args.get('username')}`"
+            + (f"\nReason: {args.get('reason')}" if args.get("reason") else "")
+        ),
+        "ban_member":     (
+            f"🔨 **Ban** `{args.get('username')}`"
+            + (f"\nReason: {args.get('reason')}" if args.get("reason") else "")
+            + (f"\nDelete {args.get('delete_days')}d of messages" if args.get("delete_days") else "")
+        ),
+        "set_slowmode":   (
+            f"⏱️ **Set slowmode** `#{args.get('channel_name')}` → "
+            f"`{args.get('seconds')}s`"
+            + (" *(disabled)*" if args.get("seconds") == 0 else "")
+        ),
+        "give_role":      f"🎭 **Give role** `{args.get('role_name')}` → `{args.get('username')}`",
+        "remove_role":    f"🎭 **Remove role** `{args.get('role_name')}` from `{args.get('username')}`",
+        "send_announcement": (
+            f"📢 **Send message** to `#{args.get('channel_name')}`\n"
+            f"> {args.get('message', '')[:120]}"
+        ),
+        "server_info":    "🔍 **Retrieve server overview** (channels, roles, members)",
+    }
+    return templates.get(name, f"`{name}` — args: `{args}`")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ADMIN ACTION EXECUTORS
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def execute_action(guild: discord.Guild, name: str, args: dict) -> str:
+    """Dispatch and execute a confirmed admin action. Returns result string."""
+    try:
+        match name:
+            case "delete_last_message":  return await _do_delete_last(guild, args)
+            case "create_channel":       return await _do_create_channel(guild, args)
+            case "delete_channel":       return await _do_delete_channel(guild, args)
+            case "kick_member":          return await _do_kick(guild, args)
+            case "ban_member":           return await _do_ban(guild, args)
+            case "set_slowmode":         return await _do_slowmode(guild, args)
+            case "give_role":            return await _do_give_role(guild, args)
+            case "remove_role":          return await _do_remove_role(guild, args)
+            case "send_announcement":    return await _do_announce(guild, args)
+            case "server_info":          return await _do_server_info(guild)
+            case _:                      return f"❓ Unknown action: `{name}`"
+    except Exception as e:
+        return f"💥 Unexpected error: {e}"
+
+
+async def _do_delete_last(guild: discord.Guild, args: dict) -> str:
+    uname = args.get("username", "")
+    cname = args.get("channel_name", "")
+    channel = discord.utils.get(guild.text_channels, name=cname)
+    if not channel:
+        return f"❌ Channel `#{cname}` not found."
+
+    member = (
+        discord.utils.find(lambda m: m.name.lower() == uname.lower(), guild.members)
+        or discord.utils.find(lambda m: m.display_name.lower() == uname.lower(), guild.members)
+    )
+    if not member:
+        return f"❌ Member `{uname}` not found."
+
+    try:
+        async for msg in channel.history(limit=200):
+            if msg.author.id == member.id:
+                preview = msg.content[:80] or "[embed/attachment]"
+                await msg.delete()
+                return (
+                    f"✅ Deleted last message by `{member.display_name}` "
+                    f"in `#{cname}`\nPreview: `{preview}`"
+                )
+        return f"❌ No recent messages by `{member.display_name}` in `#{cname}` (last 200)."
+    except discord.Forbidden:
+        return f"❌ Missing permissions to read history or delete in `#{cname}`."
+    except discord.HTTPException as e:
+        return f"❌ Discord API error: {e}"
+
+
+async def _do_create_channel(guild: discord.Guild, args: dict) -> str:
+    cname    = args.get("channel_name", "new-channel")
+    catname  = args.get("category_name")
+    private  = args.get("private", False)
+    category = discord.utils.get(guild.categories, name=catname) if catname else None
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(read_messages=False),
+        guild.me:           discord.PermissionOverwrite(read_messages=True),
+    } if private else {}
+    try:
+        ch = await guild.create_text_channel(name=cname, category=category, overwrites=overwrites)
+        return f"✅ Created `#{ch.name}` (ID: {ch.id})"
+    except discord.Forbidden:
+        return "❌ Missing permissions to create channels."
+    except discord.HTTPException as e:
+        return f"❌ Discord API error: {e}"
+
+
+async def _do_delete_channel(guild: discord.Guild, args: dict) -> str:
+    cname = args.get("channel_name", "")
+    ch    = discord.utils.get(guild.text_channels, name=cname)
+    if not ch:
+        return f"❌ Channel `#{cname}` not found."
+    try:
+        await ch.delete()
+        return f"✅ Deleted `#{cname}`."
+    except discord.Forbidden:
+        return "❌ Missing permissions to delete channels."
+    except discord.HTTPException as e:
+        return f"❌ Discord API error: {e}"
+
+
+async def _do_kick(guild: discord.Guild, args: dict) -> str:
+    uname  = args.get("username", "")
+    reason = args.get("reason", "No reason provided")
+    member = (
+        discord.utils.find(lambda m: m.name.lower() == uname.lower(), guild.members)
+        or discord.utils.find(lambda m: m.display_name.lower() == uname.lower(), guild.members)
+    )
+    if not member:
+        return f"❌ Member `{uname}` not found."
+    try:
+        await member.kick(reason=reason)
+        return f"✅ Kicked `{member.name}` — reason: {reason}"
+    except discord.Forbidden:
+        return "❌ Missing permissions to kick."
+    except discord.HTTPException as e:
+        return f"❌ Discord API error: {e}"
+
+
+async def _do_ban(guild: discord.Guild, args: dict) -> str:
+    uname       = args.get("username", "")
+    reason      = args.get("reason", "No reason provided")
+    delete_days = min(int(args.get("delete_days", 0)), 7)
+    member = (
+        discord.utils.find(lambda m: m.name.lower() == uname.lower(), guild.members)
+        or discord.utils.find(lambda m: m.display_name.lower() == uname.lower(), guild.members)
+    )
+    if not member:
+        return f"❌ Member `{uname}` not found."
+    try:
+        await member.ban(reason=reason, delete_message_days=delete_days)
+        return f"✅ Banned `{member.name}` — reason: {reason}"
+    except discord.Forbidden:
+        return "❌ Missing permissions to ban."
+    except discord.HTTPException as e:
+        return f"❌ Discord API error: {e}"
+
+
+async def _do_slowmode(guild: discord.Guild, args: dict) -> str:
+    cname   = args.get("channel_name", "")
+    seconds = int(args.get("seconds", 0))
+    ch      = discord.utils.get(guild.text_channels, name=cname)
+    if not ch:
+        return f"❌ Channel `#{cname}` not found."
+    try:
+        await ch.edit(slowmode_delay=seconds)
+        label = f"{seconds}s" if seconds > 0 else "disabled"
+        return f"✅ Slowmode on `#{cname}` → {label}"
+    except discord.Forbidden:
+        return "❌ Missing permissions to edit channel."
+    except discord.HTTPException as e:
+        return f"❌ Discord API error: {e}"
+
+
+async def _do_give_role(guild: discord.Guild, args: dict) -> str:
+    uname = args.get("username", "")
+    rname = args.get("role_name", "")
+    member = (
+        discord.utils.find(lambda m: m.name.lower() == uname.lower(), guild.members)
+        or discord.utils.find(lambda m: m.display_name.lower() == uname.lower(), guild.members)
+    )
+    if not member:
+        return f"❌ Member `{uname}` not found."
+    role = discord.utils.get(guild.roles, name=rname)
+    if not role:
+        return f"❌ Role `{rname}` not found."
+    try:
+        await member.add_roles(role)
+        return f"✅ Gave role `{rname}` to `{member.display_name}`."
+    except discord.Forbidden:
+        return "❌ Missing permissions to assign roles."
+    except discord.HTTPException as e:
+        return f"❌ Discord API error: {e}"
+
+
+async def _do_remove_role(guild: discord.Guild, args: dict) -> str:
+    uname = args.get("username", "")
+    rname = args.get("role_name", "")
+    member = (
+        discord.utils.find(lambda m: m.name.lower() == uname.lower(), guild.members)
+        or discord.utils.find(lambda m: m.display_name.lower() == uname.lower(), guild.members)
+    )
+    if not member:
+        return f"❌ Member `{uname}` not found."
+    role = discord.utils.get(guild.roles, name=rname)
+    if not role:
+        return f"❌ Role `{rname}` not found."
+    try:
+        await member.remove_roles(role)
+        return f"✅ Removed role `{rname}` from `{member.display_name}`."
+    except discord.Forbidden:
+        return "❌ Missing permissions to remove roles."
+    except discord.HTTPException as e:
+        return f"❌ Discord API error: {e}"
+
+
+async def _do_announce(guild: discord.Guild, args: dict) -> str:
+    cname = args.get("channel_name", "")
+    text  = args.get("message", "")
+    ch    = discord.utils.get(guild.text_channels, name=cname)
+    if not ch:
+        return f"❌ Channel `#{cname}` not found."
+    try:
+        await ch.send(text)
+        return f"✅ Message sent to `#{cname}`."
+    except discord.Forbidden:
+        return f"❌ Missing permissions to send in `#{cname}`."
+    except discord.HTTPException as e:
+        return f"❌ Discord API error: {e}"
+
+
+async def _do_server_info(guild: discord.Guild) -> str:
+    text_channels = [f"#{c.name}" for c in guild.text_channels]
+    voice_channels = [f"🔊 {c.name}" for c in guild.voice_channels]
+    roles = [r.name for r in guild.roles if r.name != "@everyone"]
+    total = guild.member_count
+    bots  = sum(1 for m in guild.members if m.bot)
+    lines = [
+        f"**{guild.name}** — Server Overview",
+        f"👥 Members: {total} ({total - bots} users, {bots} bots)",
+        f"📝 Text channels ({len(text_channels)}): {', '.join(text_channels[:20])}",
+        f"🔊 Voice channels ({len(voice_channels)}): {', '.join(voice_channels[:10])}",
+        f"🎭 Roles ({len(roles)}): {', '.join(roles[:20])}",
+    ]
+    return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DISCORD UI — CONFIRM / CANCEL BUTTONS
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ConfirmView(discord.ui.View):
+    """
+    Shown after PLAN step. Admin clicks Confirm → action runs. Cancel → aborted.
+    The view stores the guild + action data. Timeout = 60s.
+    """
+    def __init__(self, guild: discord.Guild, name: str, args: dict, requester: discord.Member):
+        super().__init__(timeout=60)
+        self.guild     = guild
+        self.name      = name
+        self.args      = args
+        self.requester = requester
+        self.done      = False
+
+    @discord.ui.button(label="✅ Confirm", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.requester.id:
+            await interaction.response.send_message("Only the requester can confirm.", ephemeral=True)
+            return
+        self.done = True
+        self._disable_all()
+        await interaction.response.edit_message(
+            content=f"⚙️ Executing `{self.name}`…", view=self
+        )
+        result = await execute_action(self.guild, self.name, self.args)
+        await interaction.followup.send(result)
+        # Audit
+        await audit(
+            self.guild,
+            f"[EXECUTE] requested by {self.requester} ({self.requester.id})\n"
+            f"action={self.name} args={self.args}\nresult={result}"
+        )
+        self.stop()
+
+    @discord.ui.button(label="❌ Cancel", style=discord.ButtonStyle.danger)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)
-        pending_delete(self.plan_id)
-        await interaction.followup.send("🛑 Cancelled.", ephemeral=True)
-        if interaction.guild:
-            await log_audit(interaction.guild, f"🛑 Cancelled plan {self.plan_id} by {interaction.user}")
+        if interaction.user.id != self.requester.id:
+            await interaction.response.send_message("Only the requester can cancel.", ephemeral=True)
+            return
+        self._disable_all()
+        await interaction.response.edit_message(content="🚫 Action cancelled.", view=self)
+        self.stop()
 
-# =========================
-# EVENTS
-# =========================
+    async def on_timeout(self):
+        self._disable_all()
+
+    def _disable_all(self):
+        for item in self.children:
+            item.disabled = True
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  BOT EVENTS
+# ══════════════════════════════════════════════════════════════════════════════
+
 @bot.event
 async def on_ready():
     db_init()
-    if GUILD_ID:
-        guild_obj = discord.Object(id=GUILD_ID)
-        bot.tree.copy_global_to(guild=guild_obj)
-        try:
-            await bot.tree.sync(guild=guild_obj)
-        except Exception:
-            pass
-    print(f"Logged in as {bot.user} (id={bot.user.id})")
+    log.info("Logged in as %s (ID: %s)", bot.user, bot.user.id)
+    try:
+        synced = await tree.sync()
+        log.info("Synced %d slash commands.", len(synced))
+    except Exception as e:
+        log.error("Slash sync failed: %s", e)
+    await bot.change_presence(
+        activity=discord.Activity(type=discord.ActivityType.listening, name="/ai-help")
+    )
+
 
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
-    if not message.guild:
+
+    # Process prefix commands first (if any)
+    await bot.process_commands(message)
+
+    channel_name = message.channel.name if hasattr(message.channel, "name") else ""
+
+    # ── PUBLIC CHANNEL: #ai-help ───────────────────────────────────────────
+    if channel_name == HELP_CHANNEL_NAME:
+        await handle_public_message(message)
         return
 
-    # Soft moderation check (public channels only)
-    if is_public_ai_channel(message.channel):
-        problem, reason = await moderation_check(message.content)
-        if problem:
-            # warn user (soft) + audit
-            try:
+    # ── ADMIN CHANNEL: #ai-admin ───────────────────────────────────────────
+    if channel_name == ADMIN_CHANNEL_NAME:
+        await handle_admin_message(message)
+        return
+
+
+async def handle_public_message(message: discord.Message):
+    """Handle a user message in #ai-help."""
+    member = message.author
+
+    # Detect language and remember it
+    lang = detect_lang(message.content)
+    db_upsert_memory(member.id, lang)
+
+    # ── Rate limiting for free users ───────────────────────────────────────
+    if not is_paid(member):
+        count = db_get_count(member.id)
+        if count >= FREE_DAILY_LIMIT:
+            if lang == "ru":
                 await message.reply(
-                    "Пожалуйста, без токсичности/непристойностей 🙏 "
-                    "Если есть вопрос — напиши спокойно, и я помогу.",
-                    mention_author=False
+                    f"⚠️ Вы использовали все **{FREE_DAILY_LIMIT}** бесплатных сообщений на сегодня (UTC).\n"
+                    "Обновитесь до **Nexora Pro/Elite/Ultra** для безлимитного доступа! 🚀",
+                    mention_author=False,
                 )
-            except Exception:
-                pass
-            await log_audit(message.guild, f"⚠️ Moderation flag in #{message.channel.name} by {message.author}: {reason}\nContent: {safe_short(message.content, 700)}")
-
-    # ADMIN CHANNEL: plan/confirm/execute
-    if is_ai_admin_channel(message.channel):
-        if not isinstance(message.author, discord.Member) or not is_admin_operator(message.author):
-            # ignore silently (channel should be hidden anyway)
+            else:
+                await message.reply(
+                    f"⚠️ You've used all **{FREE_DAILY_LIMIT}** free messages for today (UTC).\n"
+                    "Upgrade to **Nexora Pro/Elite/Ultra** for unlimited access! 🚀",
+                    mention_author=False,
+                )
             return
-
-        req = message.content.strip()
-        if not req:
-            return
-
-        plan = await build_admin_plan(req)
-        plan_id = new_plan_id()
-        pending_save(plan_id, message.author.id, message.channel.id, plan)
-
-        summary = plan.get("summary", "Plan")
-        risk = plan.get("risk", "low")
-        actions = plan.get("actions", [])
-        notes = plan.get("notes", "")
-
-        embed = discord.Embed(title=f"🧩 PLAN {plan_id}", description=summary, color=0x2B90D9)
-        embed.add_field(name="Risk", value=str(risk), inline=True)
-        if actions:
-            formatted = "\n".join([f"• `{a.get('name')}` {a.get('args', {})}" for a in actions])
-        else:
-            formatted = "• (no actions)"
-        embed.add_field(name="Actions", value=safe_short(formatted, 1000), inline=False)
-        if notes:
-            embed.add_field(name="Notes", value=safe_short(notes, 900), inline=False)
-
-        view = PlanView(plan_id=plan_id, requester_id=message.author.id)
-        await message.reply(embed=embed, view=view, mention_author=False)
-        await log_audit(message.guild, f"📝 PLAN {plan_id} by {message.author}:\n{summary}\nActions: {actions}")
-        return
-
-    # PUBLIC: bot should answer only in PUBLIC_AI_CHANNELS
-    if not is_public_ai_channel(message.channel):
-        return
-
-    # Trigger: mention bot OR reply to bot OR message starts with "ai" / "бот" / "help"
-    mentioned = bot.user and bot.user.mentioned_in(message)
-    is_reply_to_bot = bool(message.reference and isinstance(message.reference.resolved, discord.Message) and message.reference.resolved.author.id == bot.user.id) if bot.user else False
-    trigger_prefix = re.match(r"^(ai|бот|help|помоги|вопрос)\b", message.content.strip(), flags=re.IGNORECASE)
-
-    if not (mentioned or is_reply_to_bot or trigger_prefix):
-        return
-
-    member = message.author if isinstance(message.author, discord.Member) else None
-    if not member:
-        return
-
-    # Never tell about admin channel to users (even if they ask)
-    user_text = strip_bot_mention(message.content)
-    if not user_text:
-        user_text = "Привет!"
-
-    # Free limit logic
-    if not is_paid_member(member):
-        current = usage_get(member.id)
-        if current >= FREE_DAILY_LIMIT:
-            await message.reply(
-                f"Лимит бесплатных сообщений на сегодня исчерпан: {current}/{FREE_DAILY_LIMIT}.\n"
-                f"Я могу помогать с базовыми вопросами о сервере, но полный доступ доступен по подписке.",
-                mention_author=False
-            )
-            return
-        new_count = usage_inc(member.id)
+        new_count = db_increment(member.id)
+        remaining = FREE_DAILY_LIMIT - new_count
     else:
-        new_count = -1  # unlimited
+        remaining = None   # unlimited
 
-    # First friendly greeting (once)
-    if not greeted_get(member.id):
-        greeted_set(member.id)
-        greet = WELCOME_BLURB
-        # Include the user's question right away afterwards:
-        # We'll still answer the question below (not just greeting).
-        try:
-            await message.reply(greet, mention_author=False)
-        except Exception:
-            pass
+    # ── Get AI response ────────────────────────────────────────────────────
+    async with message.channel.typing():
+        reply = await ask_public(message.content, lang)
 
-    # If user asks to do admin actions in public, redirect WITHOUT naming channels
-    admin_keywords = ["delete", "remove", "ban", "kick", "создай канал", "удали", "бан", "кик", "роль", "permissions", "perms"]
-    if any(k in user_text.lower() for k in admin_keywords):
-        # Still can give guidance, but not execute and not reveal internal admin channel
-        await message.reply(USER_FACING_ADMIN_REDIRECT, mention_author=False)
+    if reply is None:
+        if lang == "ru":
+            await message.reply("❌ Произошла ошибка. Попробуйте снова.", mention_author=False)
+        else:
+            await message.reply("❌ An error occurred. Please try again.", mention_author=False)
         return
 
-    # Generate helpful reply about server usage
-    answer = await generate_public_reply(user_text, member)
+    # ── Append counter for free users ─────────────────────────────────────
+    if remaining is not None:
+        if lang == "ru":
+            reply += f"\n\n> 💬 Осталось бесплатных сообщений сегодня: **{remaining}/{FREE_DAILY_LIMIT}**"
+        else:
+            reply += f"\n\n> 💬 Free messages left today: **{remaining}/{FREE_DAILY_LIMIT}**"
 
-    # Append free counter (only for free users)
-    if new_count >= 0 and not is_paid_member(member):
-        answer = f"{answer}\n\n🧠 Бесплатные сообщения сегодня: {new_count}/{FREE_DAILY_LIMIT}"
+    await message.reply(reply, mention_author=False)
 
-    await message.reply(safe_short(answer, 1800), mention_author=False)
 
-# =========================
-# SLASH COMMANDS (optional)
-# =========================
-@bot.tree.command(name="ping", description="Check if Nexora AI is alive")
-async def ping(interaction: discord.Interaction):
-    await interaction.response.send_message("PONG ✅", ephemeral=True)
+async def handle_admin_message(message: discord.Message):
+    """Handle a message in #ai-admin (owner/AI Admin only)."""
+    member = message.author
 
-@bot.tree.command(name="help_nexora", description="How to use Nexora server features")
-async def help_nexora(interaction: discord.Interaction):
-    await interaction.response.send_message(WELCOME_BLURB, ephemeral=True)
+    # Check authorization
+    if not is_admin(member):
+        await message.reply(
+            "🔒 Access denied. This channel is restricted to administrators.",
+            mention_author=False,
+        )
+        return
 
-# =========================
-# RUN
-# =========================
-if not DISCORD_TOKEN:
-    raise RuntimeError("DISCORD_TOKEN is missing.")
-db_init()
-bot.run(DISCORD_TOKEN)
+    # Ignore very short/empty messages
+    if len(message.content.strip()) < 3:
+        return
 
-def new_plan_id() -> str:
-    return hex(int(time.time() * 1000))[2:]
-
-async def build_admin_plan(request_text: str) -> Dict[str, Any]:
-    """
-    Returns: {summary, risk, actions:[{name,args}], notes}
-    """
-    if not client_ai:
-        return {
-            "summary": "OpenAI not configured. No actions planned.",
-            "risk": "low",
-            "actions": [],
-            "notes": "Set OPENAI_API_KEY."
-        }
-
-    sys = (
-        "You are Nexora AI operating in ADMIN MODE.\n"
-        "You will create an execution plan for Discord server administration.\n"
-        "RULES:\n"
-        "- Only plan actions that are available as tools.\n"
-        "- Prefer minimal actions.\n"
-        "- Output must be valid JSON with keys: summary, risk, actions, notes.\n"
-        "- actions is an array of {name, args}.\n"
-        "- risk is one of: low, medium, high.\n"
-        "- Never ask for #ai-admin or mention it (this is internal).\n"
+    await audit(
+        message.guild,
+        f"[REQUEST] {member} ({member.id}): {message.content}"
     )
 
-    prompt = f"{sys}\nAdmin request: {request_text}"
+    async with message.channel.typing():
+        plan = await plan_admin(message.content)
 
-    resp = client_ai.responses.create(
-        model=MODEL_ADMIN,
-        input=prompt,
-        tools=ADMIN_TOOLS,
-        tool_choice="auto",
-    )
+    match plan["type"]:
+        case "tool_call":
+            view = ConfirmView(message.guild, plan["name"], plan["args"], member)
+            await message.reply(
+                f"**📋 PLAN**\n{plan['plan_text']}\n\n"
+                f"Proceed?",
+                view=view,
+                mention_author=False,
+            )
 
-    # Build actions from tool calls if present; fallback: parse JSON from text
-    actions = []
+        case "clarify":
+            await message.reply(
+                f"❓ **Clarification needed:**\n{plan['question']}",
+                mention_author=False,
+            )
+
+        case "text":
+            await message.reply(plan["content"], mention_author=False)
+
+        case "error":
+            await message.reply(
+                f"💥 AI Error: `{plan['content']}`\nTry rephrasing the command.",
+                mention_author=False,
+            )
+            await audit(message.guild, f"[AI ERROR] {plan['content']}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SLASH COMMANDS
+# ══════════════════════════════════════════════════════════════════════════════
+
+RULES_TEXT = """
+# 📋 Nexora AI — How to Use
+
+**What is Nexora AI?**
+I'm your server assistant. Ask me anything about how Nexora works.
+
+**What I can help with:**
+• 🎫 **Tickets** — How to open a support ticket and what to expect
+• 🎭 **Roles** — How roles work, how to earn or purchase them
+• 📈 **Trading** — Rules, guidelines, and best practices
+• 🔧 **Server navigation** — Finding channels, features, commands
+• 💬 **General questions** — Anything about Nexora
+
+**How to chat with me:**
+Just type your question naturally in this channel. No special commands needed.
+
+**Message limits:**
+• 🆓 Free users: **{limit} messages per day** (resets at UTC midnight)
+• ⭐ Nexora Pro / Elite / Ultra: **Unlimited messages**
+
+**Need moderation help?**
+Please contact the server **administrators or moderators** directly.
+
+**Tips for best answers:**
+✅ Be specific: *"How do I open a trade ticket?"*
+✅ Ask one thing at a time
+✅ Tell me your role/subscription if relevant
+""".format(limit=FREE_DAILY_LIMIT)
+
+
+@tree.command(name="pin_rules", description="Publish and pin the Nexora AI rules in #ai-help.")
+async def pin_rules(interaction: discord.Interaction):
+    # Authorization check
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("🔒 Only admins can use this command.", ephemeral=True)
+        return
+
+    # Find #ai-help
+    help_ch = discord.utils.get(interaction.guild.text_channels, name=HELP_CHANNEL_NAME)
+    if not help_ch:
+        await interaction.response.send_message(
+            f"❌ Channel `#{HELP_CHANNEL_NAME}` not found.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
     try:
-        for item in resp.output:
-            if item.type == "tool_call":
-                name = item.name
-                args = item.arguments if isinstance(item.arguments, dict) else json.loads(item.arguments)
-                actions.append({"name": name, "args": args})
-    except Exception:
-        actions = []
+        sent = await help_ch.send(RULES_TEXT)
+        await sent.pin()
+        await interaction.followup.send(f"✅ Rules published and pinned in `#{HELP_CHANNEL_NAME}`.")
+        await audit(
+            interaction.guild,
+            f"[PIN_RULES] executed by {interaction.user} ({interaction.user.id})"
+        )
+    except discord.Forbidden:
+        await interaction.followup.send("❌ Missing permissions to send or pin messages.")
+    except discord.HTTPException as e:
+        await interaction.followup.send(f"❌ Discord API error: {e}")
 
-    text = resp.output_text.strip() if hasattr(resp, "output_text") else ""
-    if text:
-        # try parse JSON with summary/risk/notes
-        try:
-            data = json.loads(text)
-            if isinstance(data, dict):
-                if not actions and isinstance(data.get("actions"), list):
-                    actions = data["actions"]
-                return {
-                    "summary": data.get("summary", "Admin plan"),
-                    "risk": data.get("risk", "low"),
-                    "actions": actions,
-                    "notes": data.get("notes", "")
-                }
-        except Exception:
-            pass
 
-    return {
-        "summary": "Admin plan generated.",
-        "risk": "low",
-        "actions": actions,
-        "notes": "Confirm to execute."
-    }
+@tree.command(name="status", description="Check bot status and your message count (public).")
+async def status(interaction: discord.Interaction):
+    member = interaction.user
+    paid   = is_paid(member)
+    count  = db_get_count(member.id)
+    lang   = db_get_lang(member.id)
 
-# =========================
-# UI: Confirm / Cancel
-# =========================
-class PlanView(discord.ui.View):
-    def __init__(self, plan_id: str, requester_id: int, timeout: int = 300):
-        super().__init__(timeout=timeout)
-        self.plan_id = plan_id
-        self.requester_id = requester_id
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        # Only requester or admin operators can confirm
-        if not interaction.user or not isinstance(interaction.user, discord.Member):
-            return False
-        if interaction.user.id == self.requester_id:
-            return True
-        return is_admin_operator(interaction.user)
-
-    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.success)
-    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)
-
-        plan = pending_load(self.plan_id)
-        if not plan:
-            await interaction.followup.send("❌ Plan not found or expired.", ephemeral=True)
-            return
-
-        guild = interaction.guild
-        if not guild:
-            await interaction.followup.send("❌ No guild context.", ephemeral=True)
-            return
-
-        results = []
-        for act in plan.get("actions", []):
-            name = act.get("name")
-            args = act.get("args", {}) or {}
-            fn = ACTION_FUNCS.get(name)
-            if not fn:
-                results.append(f"⚠️ Unknown action: {name}")
-                continue
-            try:
-                res = await fn(guild, **args)
-                results.append(res)
-            except TypeError as e:
-                results.append(f"❌ Bad args for {name}: {e}")
-            except Exception as e:
-                results.append(f"❌ {name} failed: {type(e).__name__}: {e}")
-
-        pending_delete(self.plan_id)
-
-        out = "\n".join(results) if results else "No actions executed."
-        await interaction.followup.send(safe_short(out, 1900), ephemeral=True)
-        await log_audit(guild, f"✅ EXECUTED plan {self.plan_id} by {interaction.user}:\n{out}")
-
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger)
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)
-        pending_delete(self.plan_id)
-        await interaction.followup.send("🛑 Cancelled.", ephemeral=True)
-        if interaction.guild:
-            await log_audit(interaction.guild, f"🛑 Cancelled plan {self.plan_id} by {interaction.user}")
-
-# =========================
-# EVENTS
-# =========================
-@bot.event
-async def on_ready():
-    db_init()
-    if GUILD_ID:
-        guild_obj = discord.Object(id=GUILD_ID)
-        bot.tree.copy_global_to(guild=guild_obj)
-        try:
-            await bot.tree.sync(guild=guild_obj)
-        except Exception:
-            pass
-    print(f"Logged in as {bot.user} (id={bot.user.id})")
-
-@bot.event
-async def on_message(message: discord.Message):
-    if message.author.bot:
-        return
-    if not message.guild:
-        return
-
-    # Soft moderation check (public channels only)
-    if is_public_ai_channel(message.channel):
-        problem, reason = await moderation_check(message.content)
-        if problem:
-            # warn user (soft) + audit
-            try:
-                await message.reply(
-                    "Пожалуйста, без токсичности/непристойностей 🙏 "
-                    "Если есть вопрос — напиши спокойно, и я помогу.",
-                    mention_author=False
-                )
-            except Exception:
-                pass
-            await log_audit(message.guild, f"⚠️ Moderation flag in #{message.channel.name} by {message.author}: {reason}\nContent: {safe_short(message.content, 700)}")
-
-    # ADMIN CHANNEL: plan/confirm/execute
-    if is_ai_admin_channel(message.channel):
-        if not isinstance(message.author, discord.Member) or not is_admin_operator(message.author):
-            # ignore silently (channel should be hidden anyway)
-            return
-
-        req = message.content.strip()
-        if not req:
-            return
-
-        plan = await build_admin_plan(req)
-        plan_id = new_plan_id()
-        pending_save(plan_id, message.author.id, message.channel.id, plan)
-
-        summary = plan.get("summary", "Plan")
-        risk = plan.get("risk", "low")
-        actions = plan.get("actions", [])
-        notes = plan.get("notes", "")
-
-        embed = discord.Embed(title=f"🧩 PLAN {plan_id}", description=summary, color=0x2B90D9)
-        embed.add_field(name="Risk", value=str(risk), inline=True)
-        if actions:
-            formatted = "\n".join([f"• `{a.get('name')}` {a.get('args', {})}" for a in actions])
-        else:
-            formatted = "• (no actions)"
-        embed.add_field(name="Actions", value=safe_short(formatted, 1000), inline=False)
-        if notes:
-            embed.add_field(name="Notes", value=safe_short(notes, 900), inline=False)
-
-        view = PlanView(plan_id=plan_id, requester_id=message.author.id)
-        await message.reply(embed=embed, view=view, mention_author=False)
-        await log_audit(message.guild, f"📝 PLAN {plan_id} by {message.author}:\n{summary}\nActions: {actions}")
-        return
-
-    # PUBLIC: bot should answer only in PUBLIC_AI_CHANNELS
-    if not is_public_ai_channel(message.channel):
-        return
-
-    # Trigger: mention bot OR reply to bot OR message starts with "ai" / "бот" / "help"
-    mentioned = bot.user and bot.user.mentioned_in(message)
-    is_reply_to_bot = bool(message.reference and isinstance(message.reference.resolved, discord.Message) and message.reference.resolved.author.id == bot.user.id) if bot.user else False
-    trigger_prefix = re.match(r"^(ai|бот|help|помоги|вопрос)\b", message.content.strip(), flags=re.IGNORECASE)
-
-    if not (mentioned or is_reply_to_bot or trigger_prefix):
-        return
-
-    member = message.author if isinstance(message.author, discord.Member) else None
-    if not member:
-        return
-
-    # Never tell about admin channel to users (even if they ask)
-    user_text = strip_bot_mention(message.content)
-    if not user_text:
-        user_text = "Привет!"
-
-    # Free limit logic
-    if not is_paid_member(member):
-        current = usage_get(member.id)
-        if current >= FREE_DAILY_LIMIT:
-            await message.reply(
-                f"Лимит бесплатных сообщений на сегодня исчерпан: {current}/{FREE_DAILY_LIMIT}.\n"
-                f"Я могу помогать с базовыми вопросами о сервере, но полный доступ доступен по подписке.",
-                mention_author=False
-            )
-            return
-        new_count = usage_inc(member.id)
+    if paid:
+        limit_info = "⭐ **Subscription active** — unlimited messages"
     else:
-        new_count = -1  # unlimited
+        remaining = max(0, FREE_DAILY_LIMIT - count)
+        limit_info = f"💬 Free messages left today: **{remaining}/{FREE_DAILY_LIMIT}**"
 
-    # First friendly greeting (once)
-    if not greeted_get(member.id):
-        greeted_set(member.id)
-        greet = WELCOME_BLURB
-        # Include the user's question right away afterwards:
-        # We'll still answer the question below (not just greeting).
-        try:
-            await message.reply(greet, mention_author=False)
-        except Exception:
-            pass
+    embed = discord.Embed(
+        title="Nexora AI — Status",
+        color=discord.Color.blurple(),
+    )
+    embed.add_field(name="Bot", value="✅ Online", inline=True)
+    embed.add_field(name="Your plan", value="Subscriber" if paid else "Free", inline=True)
+    embed.add_field(name="Messages", value=limit_info, inline=False)
+    embed.set_footer(text="Limits reset at UTC midnight")
 
-    # If user asks to do admin actions in public, redirect WITHOUT naming channels
-    admin_keywords = ["delete", "remove", "ban", "kick", "создай канал", "удали", "бан", "кик", "роль", "permissions", "perms"]
-    if any(k in user_text.lower() for k in admin_keywords):
-        # Still can give guidance, but not execute and not reveal internal admin channel
-        await message.reply(USER_FACING_ADMIN_REDIRECT, mention_author=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@tree.command(name="admin_exec", description="[Admin only] Run a direct admin command via AI.")
+@app_commands.describe(command="Natural language command, e.g. 'delete last message by User123 in #welcome'")
+async def admin_exec(interaction: discord.Interaction, command: str):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("🔒 Access denied.", ephemeral=True)
         return
 
-    # Generate helpful reply about server usage
-    answer = await generate_public_reply(user_text, member)
+    await interaction.response.defer()
 
-    # Append free counter (only for free users)
-    if new_count >= 0 and not is_paid_member(member):
-        answer = f"{answer}\n\n🧠 Бесплатные сообщения сегодня: {new_count}/{FREE_DAILY_LIMIT}"
+    await audit(
+        interaction.guild,
+        f"[SLASH REQUEST] {interaction.user} ({interaction.user.id}): {command}"
+    )
 
-    await message.reply(safe_short(answer, 1800), mention_author=False)
+    plan = await plan_admin(command)
 
-# =========================
-# SLASH COMMANDS (optional)
-# =========================
-@bot.tree.command(name="ping", description="Check if Nexora AI is alive")
-async def ping(interaction: discord.Interaction):
-    await interaction.response.send_message("PONG ✅", ephemeral=True)
+    if plan["type"] == "tool_call":
+        view = ConfirmView(interaction.guild, plan["name"], plan["args"], interaction.user)
+        await interaction.followup.send(
+            f"**📋 PLAN**\n{plan['plan_text']}\n\nProceed?",
+            view=view,
+        )
+    elif plan["type"] == "clarify":
+        await interaction.followup.send(f"❓ **Clarification needed:**\n{plan['question']}")
+    elif plan["type"] == "text":
+        await interaction.followup.send(plan["content"])
+    else:
+        await interaction.followup.send(f"💥 AI Error: `{plan['content']}`")
 
-@bot.tree.command(name="help_nexora", description="How to use Nexora server features")
-async def help_nexora(interaction: discord.Interaction):
-    await interaction.response.send_message(WELCOME_BLURB, ephemeral=True)
 
-# =========================
-# RUN
-# =========================
-if not DISCORD_TOKEN:
-    raise RuntimeError("DISCORD_TOKEN is missing.")
-db_init()
-bot.run(DISCORD_TOKEN)
+# ══════════════════════════════════════════════════════════════════════════════
+#  RUN
+# ══════════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    db_init()
+    bot.run(DISCORD_TOKEN, log_handler=None)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  HOW TO TEST
+# ══════════════════════════════════════════════════════════════════════════════
+"""
+TEST CHECKLIST
+══════════════════════════════════════════════════════════════════════════════
+
+1. PUBLIC MESSAGE TEST
+   ─────────────────────────────────────────────────────────────────────────
+   Channel: #ai-help
+   Send: "как открыть тикет?" (or "how do I open a ticket?")
+   Expected:
+     ✅ Bot replies with a specific, helpful answer in Russian/English
+     ✅ Shows "Free messages left today: X/10" footer
+     ✅ NO mention of ai-admin, ai-audit-log, or admin internals
+
+2. RATE LIMIT TEST
+   ─────────────────────────────────────────────────────────────────────────
+   Channel: #ai-help (use a free account — no Nexora Pro/Elite/Ultra role)
+   Action: Send 10 messages one by one
+   Expected:
+     ✅ Counter decrements: "Free messages left today: 9/10" → ... → "1/10"
+     ✅ On the 11th message: limit warning, no AI response
+     ✅ Subscriber (with PAID_ROLES) has no counter shown and no limit
+
+3. ADMIN — CREATE CHANNEL
+   ─────────────────────────────────────────────────────────────────────────
+   Channel: #ai-admin (as Owner or AI Admin role)
+   Send: "create a channel called test-arena in category Community"
+   Expected:
+     ✅ Bot shows PLAN with ➕ Create channel #test-arena details
+     ✅ Shows [✅ Confirm] [❌ Cancel] buttons
+     ✅ After Confirm: channel created, result shown
+     ✅ Audit log entry in #ai-audit-log
+
+4. ADMIN — DELETE LAST MESSAGE
+   ─────────────────────────────────────────────────────────────────────────
+   Setup: Have TestUser send a message in #welcome
+   Channel: #ai-admin
+   Send: "delete last message by TestUser in welcome"
+   Expected:
+     ✅ Bot shows PLAN: 🗑️ Delete last message by TestUser in #welcome
+     ✅ After Confirm: message deleted, preview shown in result
+     ✅ Handles "not found" / permission errors gracefully
+
+5. PIN RULES TEST
+   ─────────────────────────────────────────────────────────────────────────
+   Action: Run /pin_rules (as Owner or AI Admin)
+   Expected:
+     ✅ Full rules message appears in #ai-help
+     ✅ Message is pinned (📌)
+     ✅ Non-admin gets ephemeral "Access denied"
+     ✅ Audit log entry in #ai-audit-log
+
+══════════════════════════════════════════════════════════════════════════════
+"""
