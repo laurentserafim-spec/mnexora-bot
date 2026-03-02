@@ -2,15 +2,3 @@
   "build": { "builder": "NIXPACKS" },
   "deploy": { "startCommand": "python main.py" }
 }
-```
-
----
-
-## Шаг 3 — Добавь ENV переменные в Railway
-
-1. Зайди на [railway.app](https://railway.app) → твой проект
-2. **Variables** → добавь:
-```
-DISCORD_TOKEN    = токен с discord.dev
-OPENAI_API_KEY   = sk-...
-OWNER_ID         = твой Discord ID
