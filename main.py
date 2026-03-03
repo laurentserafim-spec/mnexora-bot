@@ -10,7 +10,8 @@
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
-import os, re, json, logging, sqlite3
+import os, re, json, logging, sqlite3, asyncio
+from collections import defaultdict, deque
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -41,10 +42,28 @@ _HIDDEN_PATTERN = re.compile(
 
 ai      = AsyncOpenAI(api_key=OPENAI_API_KEY)
 intents = discord.Intents.default()
+intents.guilds          = True
 intents.message_content = True
 intents.members         = True
 bot     = commands.Bot(command_prefix="!", intents=intents)
 tree    = bot.tree
+
+# ── Role-based daily limits (highest role wins) ───────────────────────────────
+ROLE_LIMITS: dict[str, int] = {
+    "Nexora Ultra":    999999,   # unlimited
+    "Nexora Elite":    300,
+    "Nexora Pro":      150,
+    "Verified Trader": 30,
+    "Trader":          20,
+    "Member":          15,
+}
+ROLE_LIMIT_ORDER = list(ROLE_LIMITS.keys())   # priority: first = highest
+DEFAULT_LIMIT    = 10                          # everyone / Visitor
+
+# ── Anti-spam: max 5 AI calls per 10 seconds per user ─────────────────────────
+_SPAM_WINDOW   = 10.0   # seconds
+_SPAM_MAX      = 5      # max calls per window
+_spam_calls: dict[int, deque] = defaultdict(deque)   # user_id → deque of timestamps
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -162,9 +181,34 @@ def db_upsert_memory(user_id, language, mark_seen=False):
 def is_owner(member): return member.id == OWNER_ID
 def is_admin(member): return is_owner(member) or any(r.name == "AI Admin" for r in member.roles)
 def is_paid(member):  return bool({r.name for r in member.roles} & set(get_paid_roles()))
-def is_unlimited(member):
-    if is_owner(member) or is_admin(member) or is_paid(member): return True
-    return bool({r.name for r in member.roles} & set(get_exempt_roles()))
+
+def get_user_daily_limit(member: discord.Member) -> int:
+    """Return the highest applicable daily message limit for this member."""
+    if is_owner(member) or is_admin(member):
+        return 999999
+    role_names = {r.name for r in member.roles}
+    for role_name in ROLE_LIMIT_ORDER:
+        if role_name in role_names:
+            return ROLE_LIMITS[role_name]
+    try:
+        configured = int(cfg_get("free_daily_limit"))
+        return configured if configured > 0 else DEFAULT_LIMIT
+    except Exception:
+        return DEFAULT_LIMIT
+
+def is_unlimited(member: discord.Member) -> bool:
+    return get_user_daily_limit(member) >= 999999
+
+def check_antispam(user_id: int) -> bool:
+    """Returns True if allowed, False if rate-limited (5 calls / 10 sec)."""
+    now = datetime.now(timezone.utc).timestamp()
+    dq  = _spam_calls[user_id]
+    while dq and now - dq[0] > _SPAM_WINDOW:
+        dq.popleft()
+    if len(dq) >= _SPAM_MAX:
+        return False
+    dq.append(now)
+    return True
 
 def sanitize(text): return _HIDDEN_PATTERN.sub("[server administration]", text)
 def detect_lang(text): return "ru" if re.search(r"[а-яёА-ЯЁ]", text) else "en"
@@ -222,25 +266,40 @@ def _welcome_suffix(lang, is_free, limit):
 
 async def handle_public(message, content):
     member = message.author; lang = detect_lang(content)
-    limit = get_free_limit(); unlimited = is_unlimited(member); first = db_is_first(member.id)
+    first  = db_is_first(member.id)
+
+    # Anti-spam check
+    if not check_antispam(member.id):
+        warn = ('⚠️ Слишком много запросов. Подожди 10 секунд.' if lang == 'ru'
+                else '⚠️ Too many requests. Please wait 10 seconds.')
+        await message.reply(warn, mention_author=False)
+        await _audit(message.guild,
+            f'[SPAM] {member} ({member.id}) — rate limited in #{getattr(message.channel,"name","?")}')
+        return
+
+    # Role-based daily limit
+    limit     = get_user_daily_limit(member)
+    unlimited = limit >= 999999
+
     if not unlimited:
         count = db_get_count(member.id)
         if count >= limit:
-            msg = (f"⚠️ Вы исчерпали **{limit}** бесплатных сообщений на сегодня.\nОформите **Nexora Pro/Elite/Ultra**! 🚀"
-                   if lang == "ru" else f"⚠️ You've used all **{limit}** free messages today.\nUpgrade to **Nexora Pro/Elite/Ultra**! 🚀")
+            msg = (f'⚠️ Вы исчерпали **{limit}** сообщений на сегодня.\nПовысьте роль или оформите **Nexora Pro/Elite/Ultra**! 🚀'
+                   if lang == 'ru' else f"⚠️ You've used all **{limit}** messages today.\nUpgrade your role or get **Nexora Pro/Elite/Ultra**! 🚀")
             await message.reply(msg, mention_author=False); return
         new_count = db_increment(member.id); remaining = limit - new_count
     else:
         remaining = None
+
     db_upsert_memory(member.id, lang, mark_seen=first)
     async with message.channel.typing():
         reply = await ask_ai(content, lang, paid=unlimited)
     if reply is None:
-        await message.reply("❌ Произошла ошибка. Попробуйте снова." if lang == "ru" else "❌ An error occurred.", mention_author=False); return
+        await message.reply('❌ Произошла ошибка. Попробуйте снова.' if lang == 'ru' else '❌ An error occurred.', mention_author=False); return
     if first: reply += _welcome_suffix(lang, is_free=not unlimited, limit=limit)
     if remaining is not None:
-        reply += (f"\n\n> 💬 Осталось сегодня: **{remaining}/{limit}**" if lang == "ru"
-                  else f"\n\n> 💬 Free messages left: **{remaining}/{limit}**")
+        reply += (f'\n\n> 💬 Осталось сегодня: **{remaining}/{limit}**' if lang == 'ru'
+                  else f'\n\n> 💬 Messages left today: **{remaining}/{limit}**')
     await message.reply(reply, mention_author=False)
 
 
