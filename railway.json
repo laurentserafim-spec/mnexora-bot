@@ -1,4 +1,4 @@
 {
   "build": { "builder": "NIXPACKS" },
-  "deploy": { "startCommand": "python main.py" }
+  "deploy": { "startCommand": "python -u main.py" }
 }
